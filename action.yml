@@ -1,0 +1,32 @@
+name: 'AI Code Reviewer'
+description: 'Automatically reviews pull requests using NVIDIA Nemotron and posts inline comments.'
+author: 'your-name-here'
+
+inputs:
+  nvidia-api-key:
+    description: 'NVIDIA API key (get a free one at build.nvidia.com)'
+    required: true
+  github-token:
+    description: 'Token used to post the review. Defaults to the automatic GITHUB_TOKEN.'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run AI review
+      shell: bash
+      run: python ${{ github.action_path }}/review.py
+      env:
+        NVIDIA_API_KEY: ${{ inputs.nvidia-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+
+branding:
+  icon: 'eye'
+  color: 'yellow'
