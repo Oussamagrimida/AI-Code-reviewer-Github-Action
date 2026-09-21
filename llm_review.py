@@ -2,16 +2,12 @@
 Calls NVIDIA's Nemotron endpoint to review a set of PR file diffs and
 returns structured feedback: a summary plus a list of issues, each tied
 to a specific file and line number.
-
-We ask the model for JSON, not prose, because the output has to be
-programmatically posted as inline PR comments -- "review this code" as
-free text isn't usable by the GitHub API, which needs an exact file path
-and line number per comment.
 """
 
 import os
 import json
 import re
+import time
 import requests
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -48,21 +44,38 @@ comments just to have something to say.
 """
 
 
-def review_diff(files: list[dict]) -> dict:
+def _call_nvidia_with_retry(payload: dict, headers: dict, max_attempts: int = 4) -> dict:
     """
-    files: list of {"path": str, "patch": str} -- one entry per changed
-    file, where "patch" is the unified diff text for that file (as
-    returned by the GitHub API).
+    NVIDIA's free endpoint can occasionally return transient errors
+    (502/503/504) under load. Retries with a short backoff before
+    giving up, instead of failing the whole review on one bad request.
+    """
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(NVIDIA_API_URL, json=payload, headers=headers, timeout=120)
+            if resp.status_code in (502, 503, 504):
+                raise requests.exceptions.HTTPError(
+                    f"{resp.status_code} Server Error: {resp.reason}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_error = e
+            print(f"NVIDIA API call failed (attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                wait = 5 * attempt  # 5s, 10s, 15s...
+                print(f"Retrying in {wait}s...")
+                time.sleep(wait)
+    raise last_error
 
-    Returns: {"summary": str, "issues": [{"path", "line", "severity", "body"}]}
-    """
+
+def review_diff(files: list) -> dict:
     diff_text = "\n\n".join(
         f"--- FILE: {f['path']} ---\n{f['patch']}" for f in files if f.get("patch")
     )
 
-    # Keep the prompt within a sane size -- very large PRs get truncated
-    # rather than failing outright. A production version would chunk and
-    # review in batches instead.
     MAX_CHARS = 24000
     if len(diff_text) > MAX_CHARS:
         diff_text = diff_text[:MAX_CHARS] + "\n\n[... diff truncated for length ...]"
@@ -80,19 +93,13 @@ def review_diff(files: list[dict]) -> dict:
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(NVIDIA_API_URL, json=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
-    raw_text = resp.json()["choices"][0]["message"]["content"]
+    response_json = _call_nvidia_with_retry(payload, headers)
+    raw_text = response_json["choices"][0]["message"]["content"]
 
     return _parse_json_response(raw_text)
 
 
 def _parse_json_response(raw_text: str) -> dict:
-    """
-    Models sometimes wrap JSON in markdown fences despite instructions.
-    Strip those defensively before parsing, and fail soft (empty review)
-    rather than crashing the whole CI run if parsing still fails.
-    """
     cleaned = re.sub(r"^```(?:json)?\n?|```$", "", raw_text.strip(), flags=re.MULTILINE)
     try:
         data = json.loads(cleaned)
