@@ -1,5 +1,5 @@
 name: 'AI Code Reviewer'
-description: 'Automatically reviews pull requests using NVIDIA Nemotron and posts inline comments.'
+description: 'Automatically reviews pull requests using NVIDIA Nemotron, with an optional auto-fix step.'
 author: 'your-name-here'
 
 inputs:
@@ -10,15 +10,24 @@ inputs:
     description: 'Token used to post the review. Defaults to the automatic GITHUB_TOKEN.'
     required: false
     default: ${{ github.token }}
+  enable-autofix:
+    description: >
+      If "true", attempts to automatically fix flagged bugs/security
+      issues and pushes the fix as a new commit on the PR branch. Off by
+      default -- only works for PRs from branches in the same repo (not
+      forks).
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
   steps:
-    - name: Install dependencies
+    - name: Install review dependencies
       shell: bash
       run: pip install -r ${{ github.action_path }}/requirements.txt
 
     - name: Run AI review
+      id: review
       shell: bash
       run: python ${{ github.action_path }}/review.py
       env:
@@ -26,6 +35,23 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+
+    - name: Install auto-fix dependencies
+      if: inputs.enable-autofix == 'true' && steps.review.outputs.has_bugs == 'true'
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements-autofix.txt
+
+    - name: Run auto-fix
+      if: inputs.enable-autofix == 'true' && steps.review.outputs.has_bugs == 'true'
+      shell: bash
+      run: python ${{ github.action_path }}/fixer.py
+      env:
+        NVIDIA_API_KEY: ${{ inputs.nvidia-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        REVIEW_ISSUES: ${{ steps.review.outputs.issues_summary }}
 
 branding:
   icon: 'eye'

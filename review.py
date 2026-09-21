@@ -1,15 +1,5 @@
 """
 Entry point run by the GitHub Action on every pull_request event.
-
-Reads context from environment variables that GitHub Actions provides
-automatically, fetches the PR's changed files, sends them to Nemotron for
-review, and posts the result as a real PR review with inline comments.
-
-Required environment variables (set by action.yml):
-    GITHUB_TOKEN       - provided automatically by GitHub Actions
-    GITHUB_REPOSITORY  - "owner/repo", provided automatically
-    PR_NUMBER          - the pull request number being reviewed
-    NVIDIA_API_KEY      - your NVIDIA API key, passed in as a repo secret
 """
 
 import os
@@ -35,12 +25,7 @@ def get_pr_info(repo: str, pr_number: str, token: str) -> dict:
     return resp.json()
 
 
-def get_changed_files(repo: str, pr_number: str, token: str) -> list[dict]:
-    """
-    Returns changed files with their diff ("patch") text. Skips files
-    GitHub doesn't provide a patch for (binary files, or diffs too large
-    for the API to include) since there's nothing meaningful to review.
-    """
+def get_changed_files(repo: str, pr_number: str, token: str) -> list:
     url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files"
     files = []
     page = 1
@@ -63,17 +48,7 @@ def get_changed_files(repo: str, pr_number: str, token: str) -> list[dict]:
 
 
 def post_review(repo: str, pr_number: str, token: str, commit_id: str, review: dict):
-    """
-    Posts one PR review containing a summary + inline comments.
-
-    If GitHub rejects a specific inline comment (most commonly because
-    the LLM picked a line number outside the diff), we don't fail the
-    whole run -- we drop that one comment and fold it into the summary
-    text instead, so the reviewer's other valid feedback still gets
-    posted.
-    """
     valid_comments = []
-    fallback_notes = []
 
     for issue in review.get("issues", []):
         valid_comments.append({
@@ -83,7 +58,7 @@ def post_review(repo: str, pr_number: str, token: str, commit_id: str, review: d
             "body": f"**[{issue.get('severity', 'note')}]** {issue['body']}",
         })
 
-    body = f"### 🤖 Automated review\n\n{review['summary']}"
+    body = f"### \U0001F916 Automated review\n\n{review['summary']}"
     if review.get("_raw"):
         body += f"\n\n<details><summary>raw model output</summary>\n\n```\n{review['_raw'][:2000]}\n```\n</details>"
 
@@ -98,9 +73,6 @@ def post_review(repo: str, pr_number: str, token: str, commit_id: str, review: d
     resp = requests.post(url, headers=gh_headers(token), json=payload, timeout=30)
 
     if resp.status_code >= 300 and valid_comments:
-        # Likely a bad line number in one of the comments. Retry with a
-        # summary-only review, and list the flagged issues in the body
-        # instead of failing the whole review.
         print(f"Inline comments rejected ({resp.status_code}), falling back to summary-only.")
         fallback_notes = [
             f"- **{i['path']}:{i['line']}** [{i.get('severity','note')}] {i['body']}"
@@ -134,6 +106,18 @@ def main():
 
     print(f"Found {len(review.get('issues', []))} issue(s). Posting review...")
     post_review(repo, pr_number, token, commit_id, review)
+
+    # Expose results to the optional auto-fix step via GitHub Actions
+    # outputs. Only "bug"/"security" issues are passed along.
+    fixable = [i for i in review.get("issues", []) if i.get("severity") in ("bug", "security")]
+    gh_output_path = os.environ.get("GITHUB_OUTPUT")
+    if gh_output_path:
+        with open(gh_output_path, "a") as f:
+            f.write(f"has_bugs={'true' if fixable else 'false'}\n")
+            f.write("issues_summary<<EOF\n")
+            for issue in fixable:
+                f.write(f"- {issue['path']}:{issue['line']} [{issue['severity']}] {issue['body']}\n")
+            f.write("EOF\n")
 
 
 if __name__ == "__main__":
