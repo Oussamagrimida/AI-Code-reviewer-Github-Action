@@ -11,6 +11,14 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # Skip runs triggered by the bot's own auto-fix commits -- without
+    # this, a pushed fix re-triggers "synchronize", which could review
+    # the fix, possibly find something else, fix again, re-trigger
+    # again... a self-triggering loop. GitHub's "required approval for
+    # bot-triggered runs" happened to catch this by accident (that's
+    # the "Action required" / expired-approval message), but this
+    # guard prevents it directly instead of relying on that.
+    if: github.actor != 'github-actions[bot]'
     steps:
       - uses: actions/checkout@v4
         with:
