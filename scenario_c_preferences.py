@@ -1,3 +1,4 @@
+import logging
 def save_user_preferences(user_id, preferences, db):
     try:
         db.execute(
@@ -5,5 +6,6 @@ def save_user_preferences(user_id, preferences, db):
             (preferences, user_id)
         )
         db.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"Error saving user preferences for user {user_id}: {e}")
+        raise
