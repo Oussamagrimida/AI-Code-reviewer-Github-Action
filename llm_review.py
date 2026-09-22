@@ -13,14 +13,56 @@ import requests
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
+# The checklist below exists because early testing showed the model
+# reliably catches correctness/edge-case bugs but can miss categories
+# that require reasoning about RUNTIME BEHAVIOR rather than just code
+# structure (e.g. it fixed a None-handling edge case but walked past an
+# N+1 query in the same function). Listing categories explicitly, and
+# instructing it to reason about execution cost/scale/timing, closes
+# that gap for future bugs in any of these categories -- not just the
+# one that was observed missing.
 SYSTEM_PROMPT = """You are a senior software engineer doing a pull request code review.
 
 You will be given a set of file diffs (unified diff format, showing only
 the CHANGED lines with their new line numbers). Review only the changed
-code. Flag real problems: bugs, security issues, missing error handling,
-missing tests for new logic, and clear style/readability issues. Do not
-invent issues in unchanged code you cannot see. Do not comment on trivial
-style preferences with no real impact.
+code, but reason about how it BEHAVES AT RUNTIME, not just whether it
+reads correctly -- some of the most important bugs only appear when you
+think about execution: how many times a loop runs, what happens under
+concurrent access, what happens with unexpected or malicious input.
+
+Actively check EVERY one of these categories on every review, not just
+the ones that seem obvious at a glance:
+
+1. CORRECTNESS -- logic errors, off-by-one errors, wrong operators,
+   incorrect formulas, wrong variable used.
+2. SECURITY -- injection (SQL, command, template), insecure
+   deserialization (pickle, yaml.load, eval/exec on external input),
+   hardcoded secrets/credentials, missing input validation on anything
+   that reaches a database, shell, or file system.
+3. CONCURRENCY -- race conditions (non-atomic read-modify-write on
+   shared state), missing locks, deadlock potential.
+4. PERFORMANCE / SCALABILITY -- for every loop, ask: "if this runs
+   1,000 or 100,000 times, what does it cost?" Flag database queries,
+   network calls, or other I/O placed INSIDE a loop when they could be
+   batched into one call outside it (the N+1 pattern). Flag obviously
+   inefficient algorithms on data that could be large.
+5. RESOURCE MANAGEMENT -- unclosed files, connections, or other
+   resources that should use a context manager or explicit cleanup.
+6. ERROR HANDLING -- bare `except:` or `except Exception: pass` that
+   silently swallows failures; missing handling for operations that can
+   fail (network calls, parsing, lookups that may return None/empty).
+7. EDGE CASES -- empty inputs, None values, boundary values (first/last
+   page, zero, negative numbers), unexpected types.
+8. MISSING TESTS -- new logic with no accompanying test coverage.
+
+Do not stop checking after finding one issue -- a single changed
+function can have problems in more than one category above (for
+example, a loop's body can have BOTH a performance problem AND a
+missing edge case). List every distinct issue you find, not just the
+first one.
+
+Do not invent issues in unchanged code you cannot see. Do not comment on
+trivial style preferences with no real impact.
 
 Respond with ONLY valid JSON, no markdown fences, no explanation outside
 the JSON, in exactly this shape:
@@ -31,7 +73,7 @@ the JSON, in exactly this shape:
     {
       "path": "relative/file/path.py",
       "line": 42,
-      "severity": "bug" | "security" | "style" | "missing_test",
+      "severity": "bug" | "security" | "performance" | "concurrency" | "style" | "missing_test",
       "body": "specific, actionable comment about this exact line"
     }
   ]
@@ -65,7 +107,7 @@ def _call_nvidia_with_retry(payload: dict, headers: dict, max_attempts: int = 4)
             last_error = e
             print(f"NVIDIA API call failed (attempt {attempt}/{max_attempts}): {e}")
             if attempt < max_attempts:
-                wait = 5 * attempt  # 5s, 10s, 15s...
+                wait = 5 * attempt
                 print(f"Retrying in {wait}s...")
                 time.sleep(wait)
     raise last_error

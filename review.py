@@ -108,8 +108,11 @@ def main():
     post_review(repo, pr_number, token, commit_id, review)
 
     # Expose results to the optional auto-fix step via GitHub Actions
-    # outputs. Only "bug"/"security" issues are passed along.
-    fixable = [i for i in review.get("issues", []) if i.get("severity") in ("bug", "security")]
+    # outputs. "bug", "security", "performance", and "concurrency" are
+    # treated as auto-fixable -- "style" and "missing_test" are left for
+    # a human to decide on.
+    FIXABLE_SEVERITIES = ("bug", "security", "performance", "concurrency")
+    fixable = [i for i in review.get("issues", []) if i.get("severity") in FIXABLE_SEVERITIES]
     gh_output_path = os.environ.get("GITHUB_OUTPUT")
     if gh_output_path:
         with open(gh_output_path, "a") as f:
