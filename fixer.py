@@ -8,12 +8,21 @@ If it makes changes, it commits and pushes them as a new commit
 directly onto the PR's own branch, then comments explaining what
 happened.
 
-LIMITATION: only works for PRs from a branch within the SAME repo.
-GITHUB_TOKEN can't write to a fork's branches -- on a fork PR the push
-fails safely and posts an explanatory comment instead of crashing.
+SAFETY: two layers stop the agent from editing the wrong thing --
+(1) the prompt explicitly names the exact files it's allowed to touch
+and forbids anything under .github/, and (2) after it runs, a real
+`git diff --name-only` check verifies it only touched those files
+before anything is committed or pushed. If it strayed, the fix is
+discarded (git checkout --) and a comment explains why, instead of
+pushing an unexpected change -- or worse, failing on GitHub's own
+workflow-file protection like this project did during testing.
+
+LIMITATION: pushing still only works for PRs from a branch within the
+SAME repo -- GITHUB_TOKEN can't write to a fork's branches.
 """
 
 import os
+import re
 import subprocess
 import sys
 import requests
@@ -26,7 +35,21 @@ GITHUB_API = "https://api.github.com"
 REPO_DIR = os.getcwd()
 
 
-def build_agent():
+def extract_allowed_paths(issues_text: str) -> list:
+    """
+    Pulls the exact file paths out of the issues summary written by
+    review.py (lines look like "- path/to/file.py:42 [bug] ...").
+    These are the ONLY files the agent should be allowed to touch.
+    """
+    paths = set()
+    for line in issues_text.splitlines():
+        match = re.match(r"^-\s*([^\s:]+):\d+", line.strip())
+        if match:
+            paths.add(match.group(1))
+    return sorted(paths)
+
+
+def build_agent(allowed_paths: list):
     model = ChatOpenAI(
         model="nvidia/nemotron-3-super-120b-a12b",
         base_url="https://integrate.api.nvidia.com/v1",
@@ -35,21 +58,34 @@ def build_agent():
         timeout=180,
     )
     backend = FilesystemBackend(root_dir=REPO_DIR, virtual_mode=True)
+    paths_list = "\n".join(f"  - {p}" for p in allowed_paths)
     return create_deep_agent(
         model=model,
         backend=backend,
         system_prompt=(
             "You are a careful senior engineer fixing SPECIFIC issues "
-            "that were flagged in a code review. Make the minimal edits "
-            "needed to fix exactly the listed issues -- do not refactor "
-            "or touch unrelated code. Summarize exactly what you changed."
+            "that were flagged in a code review.\n\n"
+            "You are ONLY allowed to edit these exact file(s):\n"
+            f"{paths_list}\n\n"
+            "Do NOT create, rename, move, or delete any other files. Do "
+            "NOT touch anything under .github/ (workflow configuration) "
+            "under any circumstances, even if it seems related. Make the "
+            "minimal edits needed to fix exactly the listed issues in "
+            "the allowed file(s) only. Summarize exactly what you changed."
         ),
     )
 
 
-def has_changes() -> bool:
-    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-    return bool(result.stdout.strip())
+def get_changed_files() -> list:
+    result = subprocess.run(
+        ["git", "diff", "--name-only"], capture_output=True, text=True
+    )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def discard_all_changes():
+    subprocess.run(["git", "checkout", "--", "."], check=False)
+    subprocess.run(["git", "clean", "-fd"], check=False)
 
 
 def commit_and_push(branch: str, token: str, repo: str):
@@ -89,23 +125,46 @@ def main():
         print("No flagged bugs/security issues -- skipping auto-fix.")
         return
 
+    allowed_paths = extract_allowed_paths(issues_text)
+    if not allowed_paths:
+        print("Could not determine which files to fix -- skipping auto-fix.")
+        return
+
     print(f"Attempting auto-fix for:\n{issues_text}")
+    print(f"Allowed files: {allowed_paths}")
+
     task = (
         "Fix these specific issues found in code review. Make only the "
-        f"minimal changes needed:\n\n{issues_text}"
+        f"minimal changes needed, in the allowed file(s) only:\n\n{issues_text}"
     )
 
-    agent = build_agent()
+    agent = build_agent(allowed_paths)
     result = agent.invoke({"messages": [{"role": "user", "content": task}]})
     summary = result["messages"][-1].content
     print(f"Agent summary:\n{summary}")
 
-    if not has_changes():
+    changed_files = get_changed_files()
+    if not changed_files:
         print("Agent made no file changes.")
         post_comment(
             repo, pr_number, token,
             "### \U0001F916 Auto-fix attempted\n\nThe agent looked at the flagged "
             f"issues but made no changes.\n\n{summary}",
+        )
+        return
+
+    # SAFETY CHECK: verify it only touched files it was told to.
+    unexpected = [f for f in changed_files if f not in allowed_paths]
+    if unexpected:
+        print(f"Agent touched unexpected files: {unexpected} -- discarding fix.")
+        discard_all_changes()
+        post_comment(
+            repo, pr_number, token,
+            "### \U0001F916 Auto-fix attempted but was discarded for safety\n\n"
+            f"{summary}\n\n"
+            f"**Reason:** the agent modified file(s) outside what was flagged "
+            f"({', '.join(unexpected)}), so the fix was discarded rather than "
+            "pushed. Please fix this manually or refine the issue description.",
         )
         return
 
