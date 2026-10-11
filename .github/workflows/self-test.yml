@@ -6,7 +6,7 @@ on:
 
 permissions:
   pull-requests: write
-  contents: write
+  contents: read
 
 jobs:
   review:
@@ -29,4 +29,4 @@ jobs:
       - uses: ./
         with:
           nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
-          enable-autofix: 'true'
+          enable-autofix: 'false'
