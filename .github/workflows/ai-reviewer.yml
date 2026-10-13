@@ -1,0 +1,28 @@
+name: AI Review (self-test)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout trusted action
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: trusted-action
+
+      - name: Run AI review
+        uses: ./trusted-action
+        with:
+          nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          enable-autofix: 'false'
