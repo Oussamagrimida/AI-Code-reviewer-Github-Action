@@ -1,3 +1,4 @@
+import json
 import pytest
 import requests
 import re
@@ -117,6 +118,23 @@ def test_invalid_enum_raises(field, value):
         ReviewValidationError,
         match="invalid",
     ):
+        validate_review(review, FILES)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("category", []),
+        ("category", {}),
+        ("severity", []),
+        ("severity", {}),
+    ],
+)
+def test_unhashable_enum_values_raise_validation_error(field, value):
+    review = valid_review()
+    review["issues"][0][field] = value
+
+    with pytest.raises(ReviewValidationError):
         validate_review(review, FILES)
 
 
@@ -323,6 +341,150 @@ def test_review_diff_processes_multiple_chunks(monkeypatch):
     assert len(result["issues"]) == 0
     assert "First chunk reviewed." in result["summary"]
     assert "Second chunk reviewed." in result["summary"]
+
+
+def test_review_diff_merges_and_deduplicates_chunk_findings(monkeypatch):
+    calls = []
+    first_finding = {
+        "path": "src/shared.py",
+        "line": 1,
+        "category": "correctness",
+        "severity": "high",
+        "confidence": 0.9,
+        "body": "Handle this changed value safely.",
+    }
+    second_finding = {
+        "path": "src/last.py",
+        "line": 1,
+        "category": "security",
+        "severity": "medium",
+        "confidence": 0.8,
+        "body": "Validate this changed input.",
+    }
+    reviews = [
+        {
+            "summary": "First chunk summary.",
+            "issues": [first_finding],
+        },
+        {
+            "summary": "Second chunk summary.",
+            "issues": [second_finding, first_finding],
+        },
+    ]
+
+    def fake_call(payload, headers):
+        calls.append(payload)
+        review = reviews[len(calls) - 1]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(review),
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        llm_review,
+        "_call_nvidia_with_retry",
+        fake_call,
+    )
+
+    files = [
+        {
+            "path": "src/shared.py",
+            "patch": "@@ -1 +1 @@\n-old\n+new_shared\n",
+        },
+        {
+            "path": "src/other.py",
+            "patch": "@@ -1 +1 @@\n-old\n+new_other\n",
+        },
+        {
+            "path": "src/shared.py",
+            "patch": "@@ -1 +1 @@\n-old\n+new_shared_again\n",
+        },
+        {
+            "path": "src/last.py",
+            "patch": "@@ -1 +1 @@\n-old\n+new_last\n",
+        },
+    ]
+
+    result = llm_review.review_diff(files)
+
+    assert len(calls) == 2
+    assert result["summary"] == (
+        "First chunk summary. Second chunk summary."
+    )
+    assert result["issues"] == [first_finding, second_finding]
+
+
+def test_review_diff_rejects_finding_from_another_chunk(monkeypatch):
+    calls = []
+
+    def fake_call(payload, headers):
+        calls.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "summary": "Review completed.",
+                                "issues": [
+                                    {
+                                        "path": "src/shared.py",
+                                        "line": 2,
+                                        "category": "correctness",
+                                        "severity": "medium",
+                                        "confidence": 0.9,
+                                        "body": (
+                                            "This line is only in "
+                                            "another chunk."
+                                        ),
+                                    }
+                                ],
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        llm_review,
+        "_call_nvidia_with_retry",
+        fake_call,
+    )
+
+    files = [
+        {
+            "path": "src/shared.py",
+            "patch": "@@ -1 +1 @@\n-old\n+first_chunk_line\n",
+        },
+        {
+            "path": "src/other.py",
+            "patch": "@@ -1 +1 @@\n-old\n+other_chunk_line\n",
+        },
+        {
+            "path": "src/shared.py",
+            "patch": "@@ -1,0 +2 @@\n+second_chunk_line\n",
+        },
+    ]
+    chunks = llm_review._split_diff_into_chunks(files)
+
+    assert len(chunks) == 2
+    assert llm_review._added_lines(chunks[0][0]["patch"]) == {1}
+    assert llm_review._added_lines(chunks[1][0]["patch"]) == {2}
+
+    with pytest.raises(
+        ReviewValidationError,
+        match="not an added line",
+    ):
+        llm_review.review_diff(files)
+
+    assert len(calls) == 1
+
 
 def test_duplicate_issues_are_removed():
     issues = [
@@ -632,6 +794,110 @@ def test_nvidia_retry_succeeds_after_temporary_failure(monkeypatch):
     assert len(calls) == 2
 
 
+def test_nvidia_connection_error_retries_then_succeeds(monkeypatch):
+    calls = []
+    delays = []
+    success_result = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary":"Recovered.","issues":[]}'
+                }
+            }
+        ]
+    }
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return success_result
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectionError(
+                "Connection interrupted"
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_review.requests, "post", fake_post)
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    result = _call_nvidia_with_retry(
+        {"model": "test"},
+        {},
+        max_attempts=3,
+    )
+
+    assert result == success_result
+    assert len(calls) == 2
+    assert delays == [5]
+
+
+def test_nvidia_connection_error_exhaustion_raises_and_sleeps(
+    monkeypatch,
+):
+    calls = []
+    delays = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        raise requests.exceptions.ConnectionError(
+            "Connection interrupted"
+        )
+
+    monkeypatch.setattr(llm_review.requests, "post", fake_post)
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    with pytest.raises(
+        requests.exceptions.ConnectionError,
+        match="Connection interrupted",
+    ):
+        _call_nvidia_with_retry(
+            {},
+            {},
+            max_attempts=3,
+        )
+
+    assert len(calls) == 3
+    assert delays == [5, 10]
+
+
+def test_nvidia_retryable_http_error_exhaustion_raises_and_sleeps(
+    monkeypatch,
+):
+    calls = []
+    delays = []
+
+    class FakeResponse:
+        status_code = 503
+        reason = "Service Unavailable"
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_review.requests, "post", fake_post)
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    with pytest.raises(
+        requests.exceptions.HTTPError,
+        match="503 Server Error: Service Unavailable",
+    ):
+        _call_nvidia_with_retry(
+            {},
+            {},
+            max_attempts=3,
+        )
+
+    assert len(calls) == 3
+    assert delays == [5, 10]
+
+
 
 @pytest.mark.parametrize(
     "status_code",
@@ -702,37 +968,6 @@ def test_nvidia_retries_server_errors(
     assert result["choices"][0]["message"]["content"] == (
         '{"summary":"OK.","issues":[]}'
     )
-
-def test_nvidia_retry_exhaustion_raises(monkeypatch):
-    calls = []
-
-    def fake_post(*args, **kwargs):
-        calls.append(1)
-        raise requests.exceptions.Timeout("timeout")
-
-    monkeypatch.setattr(
-        llm_review.requests,
-        "post",
-        fake_post,
-    )
-
-    monkeypatch.setattr(
-        llm_review.time,
-        "sleep",
-        lambda _: None,
-    )
-
-    with pytest.raises(
-        requests.exceptions.Timeout,
-        match="timeout",
-    ):
-        _call_nvidia_with_retry(
-            {},
-            {},
-            max_attempts=3,
-        )
-
-    assert len(calls) == 3
 
 def test_nvidia_retry_exhaustion_raises(monkeypatch):
     calls = []

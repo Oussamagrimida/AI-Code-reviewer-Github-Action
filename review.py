@@ -6,6 +6,7 @@ import os
 import sys
 import uuid
 import requests
+import time
 
 import llm_review
 
@@ -19,10 +20,45 @@ def gh_headers(token: str) -> dict:
     }
 
 
+def github_get_with_retry(
+    url: str,
+    headers: dict,
+    params: dict | None = None,
+    timeout: int = 30,
+    max_attempts: int = 4,
+    retry_delay: int = 5,
+):
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+
+            if resp.status_code in (502, 503, 504):
+                if attempt < max_attempts - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+
+            resp.raise_for_status()
+            return resp
+
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == max_attempts - 1:
+                raise
+
+            time.sleep(retry_delay * (attempt + 1))
+
+    raise RuntimeError("GitHub GET request failed unexpectedly")
+
+
+
 def get_pr_info(repo: str, pr_number: str, token: str) -> dict:
     url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}"
 
-    resp = requests.get(
+    resp = github_get_with_retry(
         url,
         headers=gh_headers(token),
         timeout=30,
@@ -43,7 +79,7 @@ def get_changed_files(
     page = 1
 
     while True:
-        resp = requests.get(
+        resp = github_get_with_retry(
             url,
             headers=gh_headers(token),
             params={
@@ -71,6 +107,40 @@ def get_changed_files(
         for file in files
         if file.get("patch")
     ]
+
+
+def _is_inline_comment_validation_error(response) -> bool:
+    json_method = getattr(response, "json", None)
+    if not callable(json_method):
+        return False
+
+    try:
+        error_data = json_method()
+    except ValueError:
+        return False
+
+    if not isinstance(error_data, dict):
+        return False
+
+    errors = error_data.get("errors")
+    if not isinstance(errors, list):
+        return False
+
+    inline_comment_fields = {
+        "line",
+        "path",
+        "position",
+        "side",
+        "subject_type",
+    }
+
+    return any(
+        isinstance(error, dict)
+        and error.get("resource") == "PullRequestReviewComment"
+        and isinstance(error.get("field"), str)
+        and error["field"] in inline_comment_fields
+        for error in errors
+    )
 
 
 def post_review(
@@ -113,6 +183,7 @@ def post_review(
         "event": "COMMENT",
         "comments": valid_comments,
     }
+    inline_comments_posted = len(valid_comments)
 
     resp = requests.post(
         url,
@@ -121,7 +192,11 @@ def post_review(
         timeout=30,
     )
 
-    if resp.status_code >= 300 and valid_comments:
+    if (
+        resp.status_code in (400, 422)
+        and valid_comments
+        and _is_inline_comment_validation_error(resp)
+    ):
         print(
             f"Inline comments rejected ({resp.status_code}), "
             "falling back to summary-only."
@@ -156,12 +231,18 @@ def post_review(
             json=payload,
             timeout=30,
         )
+        inline_comments_posted = 0
 
     resp.raise_for_status()
 
+    posted_inline_comments = len(valid_comments)
+
+    if payload["comments"] == []:
+        posted_inline_comments = 0
+
     print(
         f"Review posted: "
-        f"{len(valid_comments)} inline comment(s)."
+        f"{posted_inline_comments} inline comment(s)."
     )
 
 
@@ -231,6 +312,7 @@ def write_github_outputs(review: dict):
         f.write(f"\n{delimiter}\n")
 
 
+
 def main():
     repo = os.environ["GITHUB_REPOSITORY"]
     pr_number = os.environ["PR_NUMBER"]
@@ -267,6 +349,22 @@ def main():
 
     review = llm_review.review_diff(files)
 
+    latest_pr_info = get_pr_info(
+        repo,
+        pr_number,
+        token,
+    )
+
+    latest_commit_id = latest_pr_info["head"]["sha"]
+
+    if latest_commit_id != commit_id:
+        print(
+            "PR head changed during review. "
+            "Skipping review."
+        )
+        write_github_outputs({"issues": []})
+        return
+
     print(
         f"Found {len(review.get('issues', []))} "
         "issue(s). Posting review..."
@@ -281,6 +379,7 @@ def main():
     )
 
     write_github_outputs(review)
+
 
 
 def run():

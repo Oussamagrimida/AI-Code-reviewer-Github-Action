@@ -316,7 +316,10 @@ def validate_review(review: dict, files: list) -> dict:
                 "which is not an added line in the PR diff."
             )
 
-        if category not in VALID_CATEGORIES:
+        if (
+            not isinstance(category, str)
+            or category not in VALID_CATEGORIES
+        ):
             allowed = ", ".join(sorted(VALID_CATEGORIES))
 
             raise ReviewValidationError(
@@ -324,7 +327,10 @@ def validate_review(review: dict, files: list) -> dict:
                 f"Allowed: {allowed}."
             )
 
-        if severity not in VALID_SEVERITIES:
+        if (
+            not isinstance(severity, str)
+            or severity not in VALID_SEVERITIES
+        ):
             allowed = ", ".join(sorted(VALID_SEVERITIES))
 
             raise ReviewValidationError(
@@ -650,5 +656,4 @@ def _parse_json_response(raw_text: str) -> dict:
         )
 
     return data
-
 
