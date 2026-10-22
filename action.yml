@@ -45,6 +45,7 @@ runs:
       if: inputs.enable-autofix == 'true' && steps.review.outputs.has_bugs == 'true'
       shell: bash
       run: python ${{ github.action_path }}/fixer.py
+      working-directory: ${{ github.workspace }}
       env:
         NVIDIA_API_KEY: ${{ inputs.nvidia-api-key }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
