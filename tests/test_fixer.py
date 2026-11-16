@@ -1510,7 +1510,6 @@ def test_main_rolls_back_after_all_attempts_fail(git_repo, monkeypatch):
     assert commits == []
     assert (git_repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
     assert fixer._git_status_entries() == []
-    print("ACTUAL COMMENTS:", repr(comments))
     assert any("tests failed on every attempt" in body for body in comments)
 
 
