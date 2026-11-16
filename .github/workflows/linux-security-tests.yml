@@ -27,6 +27,9 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-autofix.txt
           python -m pip install pytest
+      - name: Diagnose POSIX security support
+        run: |
+          python -c "import os, sys; print('Python:', sys.version); print('OS:', os.name); print('os.open:', os.open in os.supports_dir_fd); print('os.replace:', os.replace in os.supports_dir_fd); print('os.rename:', os.rename in os.supports_dir_fd); print('O_NOFOLLOW:', hasattr(os, 'O_NOFOLLOW')); print('O_DIRECTORY:', hasattr(os, 'O_DIRECTORY'))"
 
       - name: Run full test suite
         run: python -m pytest -q -rs
