@@ -1,2 +1,2 @@
-deepagents
-langchain-openai
+deepagents==0.7.11
+langchain-openai==1.7.2

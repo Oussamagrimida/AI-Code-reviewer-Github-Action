@@ -288,7 +288,7 @@ def write_github_outputs(review: dict):
             f"[{issue.get('category', 'unknown')}] "
             f"[{issue.get('severity', 'info')}] "
             f"[{issue.get('confidence', 0):.0%}] "
-            f"{issue['body']}"
+            f"{' '.join(issue['body'].splitlines())}"
         )
         for issue in fixable
     )

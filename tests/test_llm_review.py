@@ -162,6 +162,15 @@ def test_unknown_file_raises():
         validate_review(review, FILES)
 
 
+def test_control_characters_in_path_are_rejected():
+    review = valid_review()
+    review["issues"][0]["path"] = "src/example.py\n- secret.py"
+    files = [{"path": review["issues"][0]["path"], "patch": PATCH}]
+
+    with pytest.raises(ReviewValidationError, match="invalid 'path'"):
+        validate_review(review, files)
+
+
 def test_context_line_is_rejected():
     review = valid_review()
 

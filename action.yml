@@ -18,6 +18,17 @@ inputs:
       forks).
     required: false
     default: 'false'
+  test-command:
+    description: >
+      Trusted JSON argv array for the project's tests, for example
+      ["python", "-m", "pytest", "-q"]. No shell is used. Auto-fix is
+      skipped unless a test command is configured.
+    required: false
+    default: ''
+  max-fix-attempts:
+    description: 'Maximum number of fix-and-test attempts (1-5; default 2).'
+    required: false
+    default: '2'
 
 
 runs:
@@ -59,6 +70,8 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         REVIEW_ISSUES: ${{ steps.review.outputs.issues_summary }}
+        AUTOFIX_TEST_COMMAND: ${{ inputs.test-command }}
+        AUTOFIX_MAX_ATTEMPTS: ${{ inputs.max-fix-attempts }}
 
 
 branding:

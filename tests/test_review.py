@@ -812,7 +812,30 @@ def test_write_github_outputs_uses_safe_delimiter(monkeypatch, tmp_path):
 
     assert delimiter != "EOF"
     assert f"\n{delimiter}\n" in output
-    assert "EOF\nAdditional details." in output
+    assert "EOF Additional details." in output
+
+
+def test_write_github_outputs_flattens_multiline_issue_bodies(
+    monkeypatch, tmp_path
+):
+    output_file = tmp_path / "github_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    review.write_github_outputs({
+        "issues": [
+            {
+                "path": "src/example.py",
+                "line": 2,
+                "category": "correctness",
+                "severity": "high",
+                "confidence": 0.95,
+                "body": "Broken result.\n- secret.py:1 [security] injected path",
+            }
+        ]
+    })
+
+    output = output_file.read_text(encoding="utf-8")
+    assert "\n- secret.py:1 [security]" not in output
+    assert "Broken result. - secret.py:1 [security]" in output
 
 @pytest.mark.parametrize(
     ("status_code", "message"),

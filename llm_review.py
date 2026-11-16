@@ -290,7 +290,11 @@ def validate_review(review: dict, files: list) -> dict:
         confidence = issue["confidence"]
         body = issue["body"]
 
-        if not isinstance(path, str) or not path.strip():
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in path)
+        ):
             raise ReviewValidationError(
                 f"Issue {index} has an invalid 'path'."
             )

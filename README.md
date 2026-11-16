@@ -96,10 +96,84 @@ instead of a moving branch.
   workflow is deliberately designed to handle fork contributions safely.
 
 Auto-fix is optional and disabled by default. Do not enable it for this
-review-only setup. If enabling it, review the `fixer.py` behavior and
-configure a trusted checkout of the PR branch and appropriate write
-permissions. It cannot push to a fork's branch using the repository's
-default token.
+review-only setup. The self-test workflow intentionally keeps it disabled.
+
+### Optional auto-fix
+
+Auto-fix is supported only for same-repository pull requests; fork PRs are
+rejected before the fixing agent or test command runs. The checkout must be
+at the PR's exact head SHA, not GitHub's synthetic merge commit. For example,
+configure a trusted workflow as follows:
+
+```yaml
+name: AI Review and Auto-Fix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # Install the project and test dependencies here, using Python 3.12.
+
+      - name: Run AI review and auto-fix
+        uses: Oussamagrimida/AI-Code-reviewer-Github-Action@main
+        with:
+          nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
+          github-token: ${{ github.token }}
+          enable-autofix: 'true'
+          test-command: '["python", "-m", "pytest", "-q"]'
+          max-fix-attempts: '2'
+```
+
+Only enable this in a default-branch workflow trusted by repository
+maintainers. Do not use `pull_request_target` to run the auto-fixer or tests
+on PR-controlled code. Restrict eligible PR authors to trusted collaborators:
+tests execute code from the PR, so repository workflow configuration and the
+test command must be trusted.
+
+`test-command` is a trusted JSON array of executable and arguments; it is
+invoked without a shell. It must not be derived from PR content. If it is
+missing or invalid, auto-fix stops without generating or pushing a fix.
+The test command has a 10-minute timeout; test output is bounded and only
+passed to the fixing agent for retries. A nonzero exit or timeout rolls back
+the current attempt and permits another attempt if any remain. Infrastructure
+failures, unauthorized file changes, and failed rollback stop immediately.
+`max-fix-attempts` accepts 1 through 5 and defaults to 2.
+
+The agent receives only copies of the review-authorized files in a temporary
+workspace. The generated edits are checked against that allowlist before
+being copied into the checkout. Tests run with a reduced environment that
+omits `GITHUB_TOKEN` and `NVIDIA_API_KEY`; the checkout's persisted GitHub
+authentication header is removed before tests, and push credentials are
+provided only to the Git push subprocess without placing the token in its
+arguments or remote URL. On Linux, the fixer process is made non-dumpable
+before tests start so an unprivileged test child cannot read its initial
+environment through `/proc`. Auto-fix fails closed if this protection is
+unavailable or the runner is not Linux. Applying edits uses no-follow
+directory handles and atomic replacement, and fails closed where those
+filesystem primitives are unavailable. These restrictions are not a general
+OS sandbox and do not protect against privileged processes.
+Failed tests are rolled back and verified. Only validated modifications to
+existing authorized files are staged, committed, and pushed. The push is
+non-forced and is guarded by PR head-SHA checks.
+
+Auto-fix requires `contents: write` to push and `pull-requests: write` to
+validate the PR and report the outcome. Keep `enable-autofix` false unless
+those permissions, the same-repository restriction, checkout SHA, trusted
+test command, and eligible authors are all configured deliberately.
 
 ## Tests
 
