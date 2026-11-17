@@ -7,7 +7,7 @@ import requests
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-MODEL = "nvidia/nemotron-3-super-120b-a12b"
+MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 VALID_CATEGORIES = {
     "correctness",
@@ -572,6 +572,9 @@ def review_diff(files: list) -> dict:
         payload = {
             "model": MODEL,
             "temperature": 0.1,
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            },
             "messages": [
                 {
                     "role": "system",
