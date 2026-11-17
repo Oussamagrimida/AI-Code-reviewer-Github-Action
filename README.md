@@ -17,10 +17,11 @@ For a pull request workflow, the Action:
    review.
 3. Parses and validates each response. A finding must use a file and an
    added line from that chunk, and must satisfy the required schema,
-   category, severity, and confidence constraints. Malformed responses
-   or invalid findings fail the review run; they are not silently
-   converted into summary-only reviews. Duplicate findings across chunks
-   are removed.
+   category, severity, and confidence constraints. Invalid individual
+   findings are discarded without losing valid findings. If the response
+   itself is malformed or unusable, the run fails with a safe, actionable
+   error rather than publishing unvalidated content. Duplicate findings
+   across chunks are removed.
 4. Fetches the pull request head again. If the head SHA changed while the
    review was being generated, it skips submission. Otherwise, it submits
    the review against the original head SHA.
@@ -30,18 +31,24 @@ eliminate a push that happens after the final check and before submission.
 
 ## API retries and review submission
 
-- GitHub GET requests retry timeouts, connection errors, and HTTP 502,
-  503, or 504 responses, up to four total attempts, waiting 5, 10, then
-  15 seconds between attempts. Other HTTP errors propagate.
-- NVIDIA API requests use the same retryable error categories, also up
-  to four total attempts with 5, 10, then 15 second delays. A timeout or
-  connection failure can be ambiguous: the provider may have received
-  the request, so retries may result in repeated inference work or
-  charges.
-- GitHub review POST requests are not automatically retried after
-  timeouts, connection errors, or server errors. A lost response can
-  leave the submission outcome uncertain; manually rerunning the
-  workflow can post another review.
+- GitHub GET requests retry timeouts, connection errors, and HTTP 429,
+  500, 502, 503, or 504 responses, up to four total attempts, waiting 5,
+  10, then 15 seconds between attempts unless a numeric `Retry-After`
+  header is present (capped at 60 seconds). Other HTTP errors are
+  reported without exposing response bodies or credentials.
+- NVIDIA API requests retry network timeouts, connection errors, and
+  HTTP 429, 500, 502, 503, or 504 responses, up to four total attempts.
+  Numeric `Retry-After` values are honored up to 60 seconds; otherwise
+  requests wait 5, 10, then 15 seconds. Permanent errors such as HTTP
+  410 are not retried. A timeout or connection failure can be ambiguous:
+  the provider may have received the request, so retries may result in
+  repeated inference work or charges.
+- GitHub review POST requests retry only explicit rate-limit responses
+  (HTTP 429 or an HTTP 403 with the rate-limit header), at most twice,
+  honoring numeric `Retry-After` values up to 60 seconds. They are not
+  retried after timeouts, connection errors, or server errors because a
+  lost response can leave the submission outcome uncertain; manually
+  rerunning the workflow can post another review.
 - If a review with inline comments receives HTTP 400 or 422 and GitHub's
   structured error response identifies an invalid
   `PullRequestReviewComment` field (such as `line`, `path`, `position`,
@@ -49,6 +56,26 @@ eliminate a push that happens after the final check and before submission.
   submission with the findings listed in its body. Unrelated or
   unrecognized errors propagate instead of triggering that fallback.
   Failure of the fallback also propagates.
+
+## NVIDIA hosted API configuration
+
+The configured hosted model is
+`nvidia/nemotron-3.5-lightning-30b-a3b`, called through
+`https://integrate.api.nvidia.com/v1/chat/completions` with Bearer
+authentication. The request uses the OpenAI-compatible `messages` format,
+`temperature`, `max_tokens: 8192`, `stream: false`, and
+`chat_template_kwargs.enable_thinking: false`. NVIDIA's current
+[model API reference](https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b/apireference)
+documents this model identifier, endpoint, Bearer authentication, request
+format, and `choices[0].message.content` response shape.
+
+An identifier in code or in NVIDIA's catalog does not guarantee that the
+hosted endpoint is enabled for a particular API key, account, or region.
+Before rollout, verify the model is currently available to the Action's
+NVIDIA key in the hosted API catalog and make a real authenticated
+non-streaming request. HTTP 410 should be treated as a model/endpoint
+availability or configuration issue, not retried. This project does not
+make live NVIDIA requests during unit or integration tests.
 
 ## Use the Action
 
@@ -185,9 +212,11 @@ python -m pytest -q
 ```
 
 The GitHub Actions unit-test workflow uses Python 3.12 and runs the same
-pytest command. The tests mock external API calls; passing them does not
-verify live credentials, GitHub permissions, NVIDIA availability, or
-real PR comment placement.
+pytest command. Tests include a controlled end-to-end pass through the
+GitHub diff fetch, NVIDIA response parsing, finding validation, and review
+publication boundaries. They do not verify live credentials, GitHub
+permissions, NVIDIA account/model availability, or real PR comment
+placement.
 
 For focused tests, run:
 
@@ -202,8 +231,13 @@ python -m pytest -q tests/test_llm_review.py
   patch are skipped, and the model cannot inspect unrelated code unless
   it is present in the supplied diff.
 - The model can miss real issues or produce invalid findings. Invalid
-  findings are rejected by validation, which fails the run rather than
-  guaranteeing a fallback review.
+  individual findings are discarded; if no valid findings remain but the
+  model returned a usable summary, the Action publishes a summary-only
+  review. If the full model response is malformed, the run fails instead of
+  publishing unvalidated output.
+- NVIDIA's API can return an asynchronous HTTP 202 response with a request
+  identifier. The current client handles synchronous completions only and
+  reports HTTP 202 as an API failure; it does not poll asynchronous jobs.
 - There is no cross-run review deduplication. Separate workflow runs may
   submit similar or duplicate reviews.
 - The optional auto-fix path is separate from review submission and is

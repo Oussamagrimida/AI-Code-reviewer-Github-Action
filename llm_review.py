@@ -2,12 +2,15 @@ import os
 import json
 import re
 import time
+from collections.abc import Mapping
+
 import requests
 
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+RETRYABLE_NVIDIA_STATUSES = {429, 500, 502, 503, 504}
 
 VALID_CATEGORIES = {
     "correctness",
@@ -29,7 +32,7 @@ VALID_SEVERITIES = {
 }
 
 HUNK_HEADER_RE = re.compile(
-    r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@"
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 )
 
 
@@ -37,12 +40,18 @@ class ReviewValidationError(ValueError):
     """Raised when the LLM response is not safe to publish as a review."""
 
 
+class NVIDIAAPIError(RuntimeError):
+    """Raised when NVIDIA cannot return a usable API response."""
+
+
 SYSTEM_PROMPT = """You are a senior software engineer doing a pull request code review.
 
-You will be given a set of file diffs (unified diff format, showing only
-the CHANGED lines with their new line numbers). Review only the changed
-code, but reason about how it BEHAVES AT RUNTIME, not just whether it
-reads correctly.
+You will be given file diffs in unified diff format. Report issues only
+on added lines (lines prefixed with "+" in a diff hunk), using their
+new-file line numbers. Never report issues on unchanged/context lines,
+deleted lines, or files not included in the supplied diff. Review only
+the changed code, but reason about how it BEHAVES AT RUNTIME, not just
+whether it reads correctly.
 
 Actively check EVERY one of these categories:
 
@@ -124,9 +133,18 @@ If there are no real issues, return an empty issues list.
 
 
 
+def _retry_delay(response, attempt):
+    headers = getattr(response, "headers", {})
+    retry_after = headers.get("Retry-After") if isinstance(headers, Mapping) else None
+    try:
+        return min(60, max(0, int(retry_after)))
+    except (TypeError, ValueError):
+        return 5 * attempt
+
+
 def _call_nvidia_with_retry(payload, headers, max_attempts=4):
-    last_error = None
-    retryable_statuses = {502, 503, 504}
+    last_status = None
+    last_failure = None
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -136,46 +154,89 @@ def _call_nvidia_with_retry(payload, headers, max_attempts=4):
                 json=payload,
                 timeout=120,
             )
-        except (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as error:
-            last_error = error
+        except requests.exceptions.Timeout:
+            last_failure = "network timeout"
+            response = None
+            last_status = None
+        except requests.exceptions.ConnectionError:
+            last_failure = "network connection error"
+            response = None
+            last_status = None
+        except requests.RequestException:
+            last_failure = "network transport error"
+            response = None
+            last_status = None
         else:
-            if response.status_code in retryable_statuses:
-                last_error = requests.exceptions.HTTPError(
-                    f"{response.status_code} Server Error: {response.reason}"
+            last_status = response.status_code
+            if last_status == 202:
+                raise NVIDIAAPIError(
+                    "NVIDIA API returned an asynchronous HTTP 202 response; "
+                    "this client supports synchronous completions only."
                 )
-            else:
-                response.raise_for_status()
-                return response.json()
+            retryable = last_status in RETRYABLE_NVIDIA_STATUSES
+            if not retryable and last_status >= 400:
+                if last_status == 410:
+                    detail = (
+                        "Verify that the configured model is available to "
+                        "this API key on NVIDIA's hosted endpoint."
+                    )
+                elif last_status in (401, 403):
+                    detail = "Check the NVIDIA API key and its endpoint access."
+                elif last_status == 429:
+                    detail = "NVIDIA rate limits persisted after retries."
+                else:
+                    detail = "Check the NVIDIA model and request configuration."
+                raise NVIDIAAPIError(
+                    f"NVIDIA API request failed (HTTP {last_status}). {detail}"
+                )
+            if not retryable:
+                try:
+                    return response.json()
+                except (ValueError, requests.exceptions.JSONDecodeError):
+                    raise NVIDIAAPIError(
+                        "NVIDIA API returned an invalid JSON response."
+                    ) from None
+            last_failure = f"HTTP {last_status}"
 
         print(
-            f"NVIDIA API call failed (attempt {attempt}/{max_attempts}): "
-            f"{last_error}"
+            f"NVIDIA API request failed ({last_failure}), "
+            f"attempt {attempt}/{max_attempts}."
         )
-
         if attempt < max_attempts:
-            wait = 5 * attempt
-            print(f"Retrying in {wait}s...")
+            wait = (
+                _retry_delay(response, attempt)
+                if response is not None
+                else 5 * attempt
+            )
             time.sleep(wait)
 
-    raise last_error
+    if last_status == 429:
+        raise NVIDIAAPIError(
+            "NVIDIA API rate limit persisted after retries; try again later."
+        ) from None
+    if last_status is not None:
+        raise NVIDIAAPIError(
+            f"NVIDIA API temporary failure persisted after retries "
+            f"(HTTP {last_status})."
+        ) from None
+    raise NVIDIAAPIError(
+        f"NVIDIA API {last_failure or 'request failure'} persisted after retries."
+    ) from None
 
 
 
 def _added_lines(patch: str) -> set[int]:
     added = set()
     current_line = None
+    new_remaining = 0
 
     for raw_line in patch.splitlines():
-        line = raw_line.lstrip()
-
-        if line.startswith("@@"):
-            match = HUNK_HEADER_RE.match(line)
+        if raw_line.startswith("@@"):
+            match = HUNK_HEADER_RE.match(raw_line)
 
             if match:
-                current_line = int(match.group(1))
+                current_line = int(match.group(3))
+                new_remaining = int(match.group(4) or 1)
             else:
                 current_line = None
 
@@ -184,21 +245,21 @@ def _added_lines(patch: str) -> set[int]:
         if current_line is None:
             continue
 
-        if line.startswith("\\"):
+        if raw_line.startswith("\\"):
             continue
 
-        if line.startswith("+++"):
-            continue
-
-        if line.startswith("+"):
-            added.add(current_line)
+        if raw_line.startswith("+"):
+            if new_remaining > 0:
+                added.add(current_line)
+                new_remaining -= 1
             current_line += 1
-
-        elif line.startswith("-"):
+        elif raw_line.startswith("-"):
             continue
-
+        elif raw_line.startswith(" "):
+            current_line += 1
+            new_remaining = max(0, new_remaining - 1)
         else:
-            current_line += 1
+            current_line = None
 
     return added
 
@@ -250,6 +311,40 @@ def validate_review(review: dict, files: list) -> dict:
         for path, file in files_by_path.items()
     }
 
+    valid_issues = []
+    rejected_count = 0
+
+    for index, issue in enumerate(issues):
+        try:
+            valid_issues.append(
+                _validate_issue(
+                    issue,
+                    index,
+                    files_by_path,
+                    added_lines_by_path,
+                )
+            )
+        except ReviewValidationError:
+            rejected_count += 1
+
+    if rejected_count:
+        print(
+            f"Discarded {rejected_count} invalid finding(s) from "
+            "the model response; valid findings were retained."
+        )
+
+    return {
+        "summary": summary.strip(),
+        "issues": valid_issues,
+    }
+
+
+def _validate_issue(issue, index, files_by_path, added_lines_by_path):
+    if not isinstance(issue, dict):
+        raise ReviewValidationError(
+            f"Issue {index} must be a JSON object."
+        )
+
     required_fields = {
         "path",
         "line",
@@ -259,108 +354,59 @@ def validate_review(review: dict, files: list) -> dict:
         "body",
     }
 
-    for index, issue in enumerate(issues):
-        if not isinstance(issue, dict):
-            raise ReviewValidationError(
-                f"Issue {index} must be a JSON object."
-            )
+    missing = required_fields - issue.keys()
+    if missing:
+        raise ReviewValidationError(
+            f"Issue {index} is missing required fields."
+        )
 
-        missing = required_fields - issue.keys()
+    if issue.keys() - required_fields:
+        raise ReviewValidationError(
+            f"Issue {index} has unexpected fields."
+        )
 
-        if missing:
-            fields = ", ".join(sorted(missing))
+    path = issue["path"]
+    line = issue["line"]
+    category = issue["category"]
+    severity = issue["severity"]
+    confidence = issue["confidence"]
+    body = issue["body"]
 
-            raise ReviewValidationError(
-                f"Issue {index} is missing required field(s): {fields}."
-            )
+    if (
+        not isinstance(path, str)
+        or not path.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in path)
+    ):
+        raise ReviewValidationError(f"Issue {index} has an invalid path.")
 
-        unexpected = issue.keys() - required_fields
+    if path not in files_by_path:
+        raise ReviewValidationError(f"Issue {index} references an unknown file.")
 
-        if unexpected:
-            fields = ", ".join(sorted(unexpected))
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        raise ReviewValidationError(f"Issue {index} has an invalid line.")
 
-            raise ReviewValidationError(
-                f"Issue {index} has unexpected field(s): {fields}."
-            )
+    if line not in added_lines_by_path[path]:
+        raise ReviewValidationError(
+            f"Issue {index} does not point to an added line."
+        )
 
-        path = issue["path"]
-        line = issue["line"]
-        category = issue["category"]
-        severity = issue["severity"]
-        confidence = issue["confidence"]
-        body = issue["body"]
+    if not isinstance(category, str) or category not in VALID_CATEGORIES:
+        raise ReviewValidationError(f"Issue {index} has an invalid category.")
 
-        if (
-            not isinstance(path, str)
-            or not path.strip()
-            or any(ord(char) < 32 or ord(char) == 127 for char in path)
-        ):
-            raise ReviewValidationError(
-                f"Issue {index} has an invalid 'path'."
-            )
+    if not isinstance(severity, str) or severity not in VALID_SEVERITIES:
+        raise ReviewValidationError(f"Issue {index} has an invalid severity.")
 
-        if path not in files_by_path:
-            raise ReviewValidationError(
-                f"Issue {index} references file '{path}', "
-                "which is not in the PR diff."
-            )
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        raise ReviewValidationError(f"Issue {index} has invalid confidence.")
 
-        if (
-            isinstance(line, bool)
-            or not isinstance(line, int)
-            or line < 1
-        ):
-            raise ReviewValidationError(
-                f"Issue {index} has an invalid 'line'."
-            )
+    if not isinstance(body, str) or not body.strip():
+        raise ReviewValidationError(f"Issue {index} has an invalid body.")
 
-        if line not in added_lines_by_path[path]:
-            raise ReviewValidationError(
-                f"Issue {index} points to {path}:{line}, "
-                "which is not an added line in the PR diff."
-            )
-
-        if (
-            not isinstance(category, str)
-            or category not in VALID_CATEGORIES
-        ):
-            allowed = ", ".join(sorted(VALID_CATEGORIES))
-
-            raise ReviewValidationError(
-                f"Issue {index} has invalid category '{category}'. "
-                f"Allowed: {allowed}."
-            )
-
-        if (
-            not isinstance(severity, str)
-            or severity not in VALID_SEVERITIES
-        ):
-            allowed = ", ".join(sorted(VALID_SEVERITIES))
-
-            raise ReviewValidationError(
-                f"Issue {index} has invalid severity '{severity}'. "
-                f"Allowed: {allowed}."
-            )
-
-        if (
-            isinstance(confidence, bool)
-            or not isinstance(confidence, (int, float))
-        ):
-            raise ReviewValidationError(
-                f"Issue {index} has an invalid 'confidence'."
-            )
-
-        if not 0 <= confidence <= 1:
-            raise ReviewValidationError(
-                f"Issue {index} confidence must be between 0 and 1."
-            )
-
-        if not isinstance(body, str) or not body.strip():
-            raise ReviewValidationError(
-                f"Issue {index} has an invalid 'body'."
-            )
-
-    return review
+    return issue
 
 
 def _split_diff_into_chunks(files, max_chars=20000, max_files_per_chunk=2):
@@ -559,6 +605,18 @@ def review_diff(files: list) -> dict:
         max_files_per_chunk=2,
     )
 
+    if not chunks:
+        return {
+            "summary": "No reviewable diff content was available.",
+            "issues": [],
+        }
+
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        raise NVIDIAAPIError(
+            "NVIDIA_API_KEY is not configured; cannot request a review."
+        )
+
     all_issues = []
     summaries = []
 
@@ -572,6 +630,8 @@ def review_diff(files: list) -> dict:
         payload = {
             "model": MODEL,
             "temperature": 0.1,
+            "max_tokens": 8192,
+            "stream": False,
             "chat_template_kwargs": {
                 "enable_thinking": False
             },
@@ -590,8 +650,6 @@ def review_diff(files: list) -> dict:
             ],
         }
 
-        api_key = os.environ.get("NVIDIA_API_KEY", "test-key")
-
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -602,14 +660,39 @@ def review_diff(files: list) -> dict:
             headers,
         )
 
-        try:
-            raw_text = response_json["choices"][0]["message"]["content"]
-
-        except (KeyError, IndexError, TypeError) as exc:
+        choices = (
+            response_json.get("choices")
+            if isinstance(response_json, dict)
+            else None
+        )
+        if (
+            not isinstance(choices, list)
+            or not choices
+            or not isinstance(choices[0], dict)
+        ):
             raise ReviewValidationError(
                 "NVIDIA response does not contain "
                 "choices[0].message.content."
-            ) from exc
+            )
+
+        choice = choices[0]
+        message = choice.get("message")
+        raw_text = (
+            message.get("content")
+            if isinstance(message, dict)
+            else None
+        )
+        finish_reason = choice.get("finish_reason")
+        if raw_text is None:
+            raise ReviewValidationError(
+                "NVIDIA response does not contain "
+                "choices[0].message.content."
+            )
+
+        if finish_reason == "length":
+            raise ReviewValidationError(
+                "NVIDIA response was truncated; reduce the diff size and retry."
+            )
 
         review = _parse_json_response(raw_text)
 

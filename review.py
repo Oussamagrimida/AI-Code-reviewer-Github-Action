@@ -3,14 +3,51 @@ Entry point run by the GitHub Action on every pull_request event.
 """
 
 import os
+import re
 import sys
-import uuid
-import requests
 import time
+import uuid
+from collections.abc import Mapping
+
+import requests
 
 import llm_review
 
 GITHUB_API = "https://api.github.com"
+RETRYABLE_GITHUB_STATUSES = {429, 500, 502, 503, 504}
+
+
+class GitHubAPIError(RuntimeError):
+    """Raised when a GitHub API operation fails."""
+
+
+class GitHubMetadataError(ValueError):
+    """Raised when GitHub returns unusable pull request data."""
+
+
+def _github_retry_delay(response, attempt, default_delay):
+    headers = getattr(response, "headers", {})
+    retry_after = (
+        headers.get("Retry-After")
+        if isinstance(headers, Mapping)
+        else None
+    )
+    try:
+        return min(60, max(0, int(retry_after)))
+    except (TypeError, ValueError):
+        return default_delay * (attempt + 1)
+
+
+def _is_github_rate_limited(response) -> bool:
+    headers = getattr(response, "headers", {})
+    return (
+        response.status_code == 429
+        or (
+            response.status_code == 403
+            and isinstance(headers, Mapping)
+            and headers.get("X-RateLimit-Remaining") == "0"
+        )
+    )
 
 
 def gh_headers(token: str) -> dict:
@@ -36,26 +73,78 @@ def github_get_with_retry(
                 params=params,
                 timeout=timeout,
             )
-
-            if resp.status_code in (502, 503, 504):
-                if attempt < max_attempts - 1:
-                    time.sleep(retry_delay * (attempt + 1))
-                    continue
-
-            resp.raise_for_status()
-            return resp
-
-        except (requests.Timeout, requests.ConnectionError):
+        except requests.Timeout:
             if attempt == max_attempts - 1:
-                raise
-
+                raise GitHubAPIError(
+                    "GitHub API request timed out after retries."
+                ) from None
             time.sleep(retry_delay * (attempt + 1))
+            continue
+        except requests.ConnectionError:
+            if attempt == max_attempts - 1:
+                raise GitHubAPIError(
+                    "GitHub API connection failed after retries."
+                ) from None
+            time.sleep(retry_delay * (attempt + 1))
+            continue
+        except requests.RequestException:
+            if attempt == max_attempts - 1:
+                raise GitHubAPIError(
+                    "GitHub API transport failed after retries."
+                ) from None
+            time.sleep(retry_delay * (attempt + 1))
+            continue
+
+        rate_limited = _is_github_rate_limited(resp)
+        if (
+            resp.status_code in RETRYABLE_GITHUB_STATUSES
+            or rate_limited
+        ):
+            if attempt == max_attempts - 1:
+                reason = (
+                    "rate limit persisted"
+                    if rate_limited
+                    else "request failed"
+                )
+                raise GitHubAPIError(
+                    f"GitHub API {reason} after retries "
+                    f"(HTTP {resp.status_code})."
+                )
+            time.sleep(
+                _github_retry_delay(resp, attempt, retry_delay)
+            )
+            continue
+
+        if resp.status_code >= 400:
+            raise GitHubAPIError(
+                f"GitHub API request failed (HTTP {resp.status_code})."
+            )
+
+        return resp
 
     raise RuntimeError("GitHub GET request failed unexpectedly")
 
 
+def _validate_pr_identifiers(repo: str, pr_number: str):
+    if (
+        not isinstance(repo, str)
+        or re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+            repo,
+        ) is None
+    ):
+        raise GitHubMetadataError(
+            "GITHUB_REPOSITORY must be in owner/repository format."
+        )
+    if (
+        not isinstance(pr_number, str)
+        or re.fullmatch(r"[1-9]\d*", pr_number) is None
+    ):
+        raise GitHubMetadataError("PR_NUMBER must be a positive integer.")
+
 
 def get_pr_info(repo: str, pr_number: str, token: str) -> dict:
+    _validate_pr_identifiers(repo, pr_number)
     url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}"
 
     resp = github_get_with_retry(
@@ -63,9 +152,26 @@ def get_pr_info(repo: str, pr_number: str, token: str) -> dict:
         headers=gh_headers(token),
         timeout=30,
     )
-    resp.raise_for_status()
-
-    return resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise GitHubMetadataError(
+            "GitHub returned invalid JSON for pull request metadata."
+        ) from None
+    if not isinstance(data, dict):
+        raise GitHubMetadataError(
+            "GitHub returned invalid pull request metadata."
+        )
+    head = data.get("head")
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if (
+        not isinstance(sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None
+    ):
+        raise GitHubMetadataError(
+            "GitHub pull request metadata is missing a valid head SHA."
+        )
+    return data
 
 
 def get_changed_files(
@@ -73,6 +179,7 @@ def get_changed_files(
     pr_number: str,
     token: str,
 ) -> list:
+    _validate_pr_identifiers(repo, pr_number)
     url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files"
 
     files = []
@@ -89,24 +196,39 @@ def get_changed_files(
             timeout=30,
         )
 
-        resp.raise_for_status()
-
-        batch = resp.json()
+        try:
+            batch = resp.json()
+        except ValueError:
+            raise GitHubMetadataError(
+                "GitHub returned invalid JSON for the changed-file list."
+            ) from None
 
         if not batch:
             break
+        if not isinstance(batch, list):
+            raise GitHubMetadataError(
+                "GitHub returned an invalid changed-file list."
+            )
 
-        files.extend(batch)
+        for file in batch:
+            if not isinstance(file, dict):
+                raise GitHubMetadataError(
+                    "GitHub returned invalid changed-file metadata."
+                )
+            path = file.get("filename")
+            patch = file.get("patch", "")
+            if (
+                not isinstance(path, str)
+                or not path
+                or (patch is not None and not isinstance(patch, str))
+            ):
+                raise GitHubMetadataError(
+                    "GitHub returned invalid changed-file metadata."
+                )
+            files.append({"path": path, "patch": patch or ""})
         page += 1
 
-    return [
-        {
-            "path": file["filename"],
-            "patch": file.get("patch", ""),
-        }
-        for file in files
-        if file.get("patch")
-    ]
+    return files
 
 
 def _is_inline_comment_validation_error(response) -> bool:
@@ -141,6 +263,38 @@ def _is_inline_comment_validation_error(response) -> bool:
         and error["field"] in inline_comment_fields
         for error in errors
     )
+
+
+def _post_github_review(url: str, headers: dict, payload: dict):
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+        except requests.Timeout:
+            raise GitHubAPIError(
+                "GitHub review publication timed out; the submission outcome "
+                "may be uncertain. Check the pull request before rerunning."
+            ) from None
+        except requests.ConnectionError:
+            raise GitHubAPIError(
+                "GitHub review publication lost its connection; the submission "
+                "outcome may be uncertain. Check the pull request before rerunning."
+            ) from None
+        except requests.RequestException:
+            raise GitHubAPIError(
+                "GitHub review publication encountered a transport failure."
+            ) from None
+
+        rate_limited = _is_github_rate_limited(response)
+        if not rate_limited or attempt == 2:
+            return response
+        time.sleep(_github_retry_delay(response, attempt, 5))
+
+    raise GitHubAPIError("GitHub review publication failed unexpectedly.")
 
 
 def post_review(
@@ -183,13 +337,10 @@ def post_review(
         "event": "COMMENT",
         "comments": valid_comments,
     }
-    inline_comments_posted = len(valid_comments)
-
-    resp = requests.post(
+    resp = _post_github_review(
         url,
-        headers=gh_headers(token),
-        json=payload,
-        timeout=30,
+        gh_headers(token),
+        payload,
     )
 
     if (
@@ -225,20 +376,22 @@ def post_review(
             "comments": [],
         }
 
-        resp = requests.post(
+        resp = _post_github_review(
             url,
-            headers=gh_headers(token),
-            json=payload,
-            timeout=30,
+            gh_headers(token),
+            payload,
         )
-        inline_comments_posted = 0
+    if resp.status_code >= 400:
+        if _is_github_rate_limited(resp):
+            raise GitHubAPIError(
+                "GitHub review publication was rate limited "
+                f"(HTTP {resp.status_code})."
+            )
+        raise GitHubAPIError(
+            f"GitHub review publication failed (HTTP {resp.status_code})."
+        )
 
-    resp.raise_for_status()
-
-    posted_inline_comments = len(valid_comments)
-
-    if payload["comments"] == []:
-        posted_inline_comments = 0
+    posted_inline_comments = len(payload["comments"])
 
     print(
         f"Review posted: "
@@ -314,9 +467,12 @@ def write_github_outputs(review: dict):
 
 
 def main():
-    repo = os.environ["GITHUB_REPOSITORY"]
-    pr_number = os.environ["PR_NUMBER"]
-    token = os.environ["GITHUB_TOKEN"]
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    pr_number = os.environ.get("PR_NUMBER", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    _validate_pr_identifiers(repo, pr_number)
+    if not token:
+        raise GitHubMetadataError("GITHUB_TOKEN is not configured.")
 
     print(
         f"Reviewing {repo} PR #{pr_number}..."
@@ -337,17 +493,27 @@ def main():
     )
 
     if not files:
+        print("No changed files were returned by GitHub; skipping review.")
+        write_github_outputs({"issues": []})
+        return
+
+    reviewable_files = [
+        file for file in files
+        if isinstance(file.get("patch"), str) and file["patch"].strip()
+    ]
+    if not reviewable_files:
         print(
-            "No reviewable file diffs found -- skipping."
+            "Changed files were returned, but none contained a reviewable "
+            "diff; skipping model review."
         )
         write_github_outputs({"issues": []})
         return
 
     print(
-        f"Reviewing {len(files)} changed file(s)..."
+        f"Reviewing {len(reviewable_files)} changed file(s)..."
     )
 
-    review = llm_review.review_diff(files)
+    review_result = llm_review.review_diff(reviewable_files)
 
     latest_pr_info = get_pr_info(
         repo,
@@ -366,7 +532,7 @@ def main():
         return
 
     print(
-        f"Found {len(review.get('issues', []))} "
+        f"Found {len(review_result.get('issues', []))} "
         "issue(s). Posting review..."
     )
 
@@ -375,10 +541,10 @@ def main():
         pr_number,
         token,
         commit_id,
-        review,
+        review_result,
     )
 
-    write_github_outputs(review)
+    write_github_outputs(review_result)
 
 
 
@@ -388,14 +554,36 @@ def run():
 
     except llm_review.ReviewValidationError as e:
         print(
-            f"Review validation failed: {e}",
+            f"Invalid NVIDIA model output: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    except llm_review.NVIDIAAPIError as e:
+        print(
+            f"NVIDIA API failure: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    except GitHubMetadataError as e:
+        print(
+            f"Invalid pull request metadata: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    except GitHubAPIError as e:
+        print(
+            f"GitHub API failure: {e}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     except Exception as e:
         print(
-            f"Review failed: {e}",
+            f"Review failed due to an internal error "
+            f"({type(e).__name__}).",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -380,7 +380,7 @@ def build_agent(allowed_paths: list, root_dir: str = None):
     from deepagents.backends import FilesystemBackend
 
     model = ChatOpenAI(
-        model="nvidia/nemotron-3-super-120b-a12b",
+        model="nvidia/nemotron-3.5-lightning-30b-a3b",
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=os.environ["NVIDIA_API_KEY"],
         max_retries=5,

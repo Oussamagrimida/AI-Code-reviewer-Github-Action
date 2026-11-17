@@ -2,8 +2,10 @@ import json
 import pytest
 import requests
 import re
+from requests.structures import CaseInsensitiveDict
 
 from llm_review import (
+    NVIDIAAPIError,
     ReviewValidationError,
     _added_lines,
     _call_nvidia_with_retry,
@@ -11,6 +13,11 @@ from llm_review import (
     validate_review,
 )
 import llm_review
+
+
+@pytest.fixture(autouse=True)
+def nvidia_api_key(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
 
 
 PATCH = """@@ -1,4 +1,5 @@
@@ -65,6 +72,68 @@ def test_valid_review_is_accepted():
     )
 
 
+def test_valid_findings_survive_invalid_references_across_files():
+    files = [
+        {
+            "path": "src/one.py",
+            "patch": (
+                "@@ -1,3 +1,4 @@\n"
+                " context\n"
+                " +source text begins with a plus\n"
+                "-deleted\n"
+                "+added\n"
+                " unchanged\n"
+                "@@ -10 +11,2 @@\n"
+                "+second hunk\n"
+                "+third hunk line\n"
+            ),
+        },
+        {
+            "path": "src/two.py",
+            "patch": "@@ -0,0 +1 @@\n+new file line\n",
+        },
+    ]
+    assert _added_lines(files[0]["patch"]) == {3, 11, 12}
+
+    def finding(path, line, body):
+        return {
+            "path": path,
+            "line": line,
+            "category": "correctness",
+            "severity": "medium",
+            "confidence": 0.8,
+            "body": body,
+        }
+
+    review = {
+        "summary": "The diff contains two actionable issues.",
+        "issues": [
+            finding("src/one.py", 3, "Issue on a changed line."),
+            finding("src/one.py", 2, "Context line must not be posted."),
+            finding("src/one.py", 4, "Unchanged line must not be posted."),
+            finding("src/two.py", 1, "Issue in another changed file."),
+            finding("src/outside.py", 1, "File is not part of this PR."),
+        ],
+    }
+
+    validated = validate_review(review, files)
+    assert validated["summary"] == review["summary"]
+    assert [
+        (issue["path"], issue["line"])
+        for issue in validated["issues"]
+    ] == [("src/one.py", 3), ("src/two.py", 1)]
+
+
+def test_review_with_only_invalid_findings_keeps_safe_summary():
+    review = valid_review()
+    review["issues"][0]["line"] = 3
+
+    assert validate_review(review, FILES) == {
+        "summary": review["summary"],
+        "issues": [],
+    }
+
+
 def test_empty_issue_list_is_valid():
     review = {
         "summary": "No actionable issues found.",
@@ -90,16 +159,12 @@ def test_non_object_json_raises():
         _parse_json_response("[]")
 
 
-def test_missing_required_issue_field_raises():
+def test_missing_required_issue_field_is_discarded():
     review = valid_review()
 
     del review["issues"][0]["confidence"]
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="confidence",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
 @pytest.mark.parametrize(
@@ -109,16 +174,12 @@ def test_missing_required_issue_field_raises():
         ("severity", "bug"),
     ],
 )
-def test_invalid_enum_raises(field, value):
+def test_invalid_enum_is_discarded(field, value):
     review = valid_review()
 
     review["issues"][0][field] = value
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="invalid",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
 @pytest.mark.parametrize(
@@ -130,81 +191,59 @@ def test_invalid_enum_raises(field, value):
         ("severity", {}),
     ],
 )
-def test_unhashable_enum_values_raise_validation_error(field, value):
+def test_unhashable_enum_values_are_discarded(field, value):
     review = valid_review()
     review["issues"][0][field] = value
 
-    with pytest.raises(ReviewValidationError):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
-def test_invalid_confidence_raises():
+def test_invalid_confidence_is_discarded():
     review = valid_review()
 
     review["issues"][0]["confidence"] = 1.1
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="between 0 and 1",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
-def test_unknown_file_raises():
+def test_unknown_file_is_discarded():
     review = valid_review()
 
     review["issues"][0]["path"] = "src/missing.py"
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="not in the PR diff",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
-def test_control_characters_in_path_are_rejected():
+def test_control_characters_in_path_are_discarded():
     review = valid_review()
     review["issues"][0]["path"] = "src/example.py\n- secret.py"
     files = [{"path": review["issues"][0]["path"], "patch": PATCH}]
 
-    with pytest.raises(ReviewValidationError, match="invalid 'path'"):
-        validate_review(review, files)
+    assert validate_review(review, files)["issues"] == []
 
 
-def test_context_line_is_rejected():
+def test_context_line_is_discarded():
     review = valid_review()
 
     review["issues"][0]["line"] = 3
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="not an added line",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
-def test_deleted_line_is_rejected():
+def test_deleted_line_is_discarded():
     review = valid_review()
 
     review["issues"][0]["line"] = 10
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="not an added line",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
-def test_unexpected_issue_field_is_rejected():
+def test_unexpected_issue_field_is_discarded():
     review = valid_review()
 
     review["issues"][0]["extra"] = "unexpected"
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="unexpected field",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
 def test_unexpected_top_level_field_is_rejected():
@@ -231,16 +270,17 @@ def test_invalid_summary_is_rejected():
         validate_review(review, FILES)
 
 def test_added_lines_multiple_hunks():
-    patch = """@@ -10,3 +10,4 @@
-    def hello():
-        x = 1
-        +y = 2
-    @@ -50,3 +51,5 @@
-    def goodbye():
-        +a = 10
-        +b = 20
-        return True
-    """
+    patch = (
+        "@@ -10,3 +10,4 @@\n"
+        " def hello():\n"
+        " x = 1\n"
+        "+y = 2\n"
+        "@@ -50,3 +51,5 @@\n"
+        " def goodbye():\n"
+        "+a = 10\n"
+        "+b = 20\n"
+        " return True\n"
+    )
 
     files = [
         {
@@ -251,20 +291,20 @@ def test_added_lines_multiple_hunks():
 
     assert llm_review._added_lines(patch) == {12, 52, 53}
 def test_added_lines_multiple_hunks_with_deleted_and_context_lines():
-    patch = """@@ -10,4 +10,5 @@
-    def hello():
-        x = 1
-        -old = 2
-        +new = 2
-        return x
-
-    @@ -30,4 +31,6 @@
-    def goodbye():
-        -old_a = 10
-        +new_a = 10
-        +new_b = 20
-        return True
-    """
+    patch = (
+        "@@ -10,4 +10,5 @@\n"
+        " def hello():\n"
+        " x = 1\n"
+        "-old = 2\n"
+        "+new = 2\n"
+        " return x\n"
+        "@@ -30,4 +31,6 @@\n"
+        " def goodbye():\n"
+        "-old_a = 10\n"
+        "+new_a = 10\n"
+        "+new_b = 20\n"
+        " return True\n"
+    )
 
     assert llm_review._added_lines(patch) == {12, 32, 33}
 
@@ -428,7 +468,7 @@ def test_review_diff_merges_and_deduplicates_chunk_findings(monkeypatch):
     assert result["issues"] == [first_finding, second_finding]
 
 
-def test_review_diff_rejects_finding_from_another_chunk(monkeypatch):
+def test_review_diff_keeps_finding_only_valid_in_its_chunk(monkeypatch):
     calls = []
 
     def fake_call(payload, headers):
@@ -486,13 +526,13 @@ def test_review_diff_rejects_finding_from_another_chunk(monkeypatch):
     assert llm_review._added_lines(chunks[0][0]["patch"]) == {1}
     assert llm_review._added_lines(chunks[1][0]["patch"]) == {2}
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="not an added line",
-    ):
-        llm_review.review_diff(files)
+    result = llm_review.review_diff(files)
 
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert [
+        (issue["path"], issue["line"])
+        for issue in result["issues"]
+    ] == [("src/shared.py", 2)]
 
 
 def test_duplicate_issues_are_removed():
@@ -537,15 +577,11 @@ def test_all_valid_severities_are_accepted():
         assert validate_review(review, FILES) == review
 
 
-def test_invalid_severity_is_rejected():
+def test_invalid_severity_is_discarded():
     review = valid_review()
     review["issues"][0]["severity"] = "urgent"
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="invalid severity",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
 @pytest.mark.parametrize(
@@ -561,15 +597,11 @@ def test_invalid_severity_is_rejected():
         1,
     ],
 )
-def test_invalid_severity_values_are_rejected(severity):
+def test_invalid_severity_values_are_discarded(severity):
     review = valid_review()
     review["issues"][0]["severity"] = severity
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="invalid severity",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 def test_system_prompt_contains_severity_definitions():
     assert "Severity definitions:" in llm_review.SYSTEM_PROMPT
@@ -594,35 +626,29 @@ def test_valid_confidence_values_are_accepted(confidence):
     "confidence",
     [-0.01, 1.01, 2, -1],
 )
-def test_out_of_range_confidence_is_rejected(confidence):
+def test_out_of_range_confidence_is_discarded(confidence):
     review = valid_review()
     review["issues"][0]["confidence"] = confidence
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="between 0 and 1",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 
 @pytest.mark.parametrize(
     "confidence",
     [True, False, "0.9", "high", None, [], {}],
 )
-def test_invalid_confidence_types_are_rejected(confidence):
+def test_invalid_confidence_types_are_discarded(confidence):
     review = valid_review()
     review["issues"][0]["confidence"] = confidence
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="invalid.*confidence",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 def test_system_prompt_contains_confidence_guidance():
     assert "Confidence scoring:" in llm_review.SYSTEM_PROMPT
     assert "between 0 and 1" in llm_review.SYSTEM_PROMPT
     assert "confidence represents how certain" in llm_review.SYSTEM_PROMPT
+    assert "Report issues only" in llm_review.SYSTEM_PROMPT
+    assert "Never report issues on unchanged/context lines" in llm_review.SYSTEM_PROMPT
 
 def test_markdown_json_code_fence_is_accepted():
     raw = """```json
@@ -715,15 +741,11 @@ def test_issues_must_be_a_list():
         validate_review(review, FILES)
 
 
-def test_issue_must_be_an_object():
+def test_non_object_issue_is_discarded():
     review = valid_review()
     review["issues"] = ["invalid issue"]
 
-    with pytest.raises(
-        ReviewValidationError,
-        match="must be a JSON object",
-    ):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 @pytest.mark.parametrize(
     "field,value",
@@ -735,12 +757,11 @@ def test_issue_must_be_an_object():
         ("body", 123),
     ],
 )
-def test_invalid_issue_field_types_are_rejected(field, value):
+def test_invalid_issue_field_types_are_discarded(field, value):
     review = valid_review()
     review["issues"][0][field] = value
 
-    with pytest.raises(ReviewValidationError):
-        validate_review(review, FILES)
+    assert validate_review(review, FILES)["issues"] == []
 
 def test_nvidia_retry_succeeds_after_temporary_failure(monkeypatch):
     calls = []
@@ -862,10 +883,7 @@ def test_nvidia_connection_error_exhaustion_raises_and_sleeps(
     monkeypatch.setattr(llm_review.requests, "post", fake_post)
     monkeypatch.setattr(llm_review.time, "sleep", delays.append)
 
-    with pytest.raises(
-        requests.exceptions.ConnectionError,
-        match="Connection interrupted",
-    ):
+    with pytest.raises(NVIDIAAPIError, match="connection error"):
         _call_nvidia_with_retry(
             {},
             {},
@@ -893,10 +911,7 @@ def test_nvidia_retryable_http_error_exhaustion_raises_and_sleeps(
     monkeypatch.setattr(llm_review.requests, "post", fake_post)
     monkeypatch.setattr(llm_review.time, "sleep", delays.append)
 
-    with pytest.raises(
-        requests.exceptions.HTTPError,
-        match="503 Server Error: Service Unavailable",
-    ):
+    with pytest.raises(NVIDIAAPIError, match="HTTP 503"):
         _call_nvidia_with_retry(
             {},
             {},
@@ -910,7 +925,7 @@ def test_nvidia_retryable_http_error_exhaustion_raises_and_sleeps(
 
 @pytest.mark.parametrize(
     "status_code",
-    [502, 503, 504],
+    [429, 500, 502, 503, 504],
 )
 def test_nvidia_retries_server_errors(
     monkeypatch,
@@ -978,6 +993,127 @@ def test_nvidia_retries_server_errors(
         '{"summary":"OK.","issues":[]}'
     )
 
+
+def test_nvidia_gone_response_is_not_retried(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 410
+
+    monkeypatch.setattr(
+        llm_review.requests,
+        "post",
+        lambda *args, **kwargs: calls.append(1) or FakeResponse(),
+    )
+
+    with pytest.raises(NVIDIAAPIError, match="HTTP 410"):
+        _call_nvidia_with_retry({}, {}, max_attempts=4)
+
+    assert len(calls) == 1
+
+
+def test_nvidia_pending_response_is_reported_as_api_failure(monkeypatch):
+    class FakeResponse:
+        status_code = 202
+
+    monkeypatch.setattr(
+        llm_review.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    with pytest.raises(NVIDIAAPIError, match="asynchronous HTTP 202"):
+        _call_nvidia_with_retry({}, {})
+
+
+def test_nvidia_rate_limit_honors_retry_after(monkeypatch):
+    calls = []
+    delays = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.headers = CaseInsensitiveDict({"retry-after": "3"})
+
+        def json(self):
+            return {"choices": []}
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return FakeResponse(429 if len(calls) == 1 else 200)
+
+    monkeypatch.setattr(llm_review.requests, "post", fake_post)
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    _call_nvidia_with_retry({}, {}, max_attempts=2)
+    assert len(calls) == 2
+    assert delays == [3]
+
+
+def test_nvidia_rate_limit_retry_after_is_capped(monkeypatch):
+    class FakeResponse:
+        status_code = 429
+        headers = CaseInsensitiveDict({"Retry-After": "300"})
+
+    monkeypatch.setattr(
+        llm_review.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+    delays = []
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    with pytest.raises(NVIDIAAPIError, match="rate limit"):
+        _call_nvidia_with_retry({}, {}, max_attempts=2)
+
+    assert delays == [60]
+
+
+def test_nvidia_malformed_retry_after_uses_bounded_backoff(monkeypatch):
+    calls = []
+    delays = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.headers = CaseInsensitiveDict(
+                {"Retry-After": "not-a-number"}
+            )
+
+        def json(self):
+            return {"choices": []}
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return FakeResponse(429 if len(calls) == 1 else 200)
+
+    monkeypatch.setattr(llm_review.requests, "post", fake_post)
+    monkeypatch.setattr(llm_review.time, "sleep", delays.append)
+
+    _call_nvidia_with_retry({}, {}, max_attempts=2)
+
+    assert len(calls) == 2
+    assert delays == [5]
+
+
+def test_nvidia_malformed_http_json_has_safe_error(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("private response body")
+
+    monkeypatch.setattr(
+        llm_review.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    with pytest.raises(NVIDIAAPIError, match="invalid JSON") as error:
+        _call_nvidia_with_retry({}, {})
+    assert "private response body" not in str(error.value)
+
+
 def test_nvidia_retry_exhaustion_raises(monkeypatch):
     calls = []
 
@@ -997,10 +1133,7 @@ def test_nvidia_retry_exhaustion_raises(monkeypatch):
         lambda _: None,
     )
 
-    with pytest.raises(
-        requests.exceptions.Timeout,
-        match="timeout",
-    ):
+    with pytest.raises(NVIDIAAPIError, match="network timeout"):
         _call_nvidia_with_retry(
             {},
             {},
@@ -1031,10 +1164,7 @@ def test_nvidia_does_not_retry_client_errors(monkeypatch):
         fake_post,
     )
 
-    with pytest.raises(
-        requests.exceptions.HTTPError,
-        match="401",
-    ):
+    with pytest.raises(NVIDIAAPIError, match="HTTP 401"):
         _call_nvidia_with_retry(
             {},
             {},
@@ -1387,8 +1517,10 @@ def test_split_chunk_review_rejects_context_line():
                 ],
             }
 
-            with pytest.raises(ReviewValidationError):
-                llm_review.validate_review(review, [chunk_file])
+            assert llm_review.validate_review(
+                review,
+                [chunk_file],
+            )["issues"] == []
             return
 
     pytest.fail("No context line was found to test")
@@ -1476,7 +1608,7 @@ def test_review_diff_with_no_patches_does_not_call_api(monkeypatch):
     result = llm_review.review_diff([])
 
     assert result == {
-        "summary": "",
+        "summary": "No reviewable diff content was available.",
         "issues": [],
     }
 
@@ -1510,6 +1642,40 @@ def test_review_diff_rejects_malformed_api_responses(
 
     with pytest.raises(ReviewValidationError):
         llm_review.review_diff(files)
+
+
+def test_review_diff_rejects_truncated_completion(monkeypatch):
+    monkeypatch.setattr(
+        llm_review,
+        "_call_nvidia_with_retry",
+        lambda *args, **kwargs: {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": '{"summary":"partial'},
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(ReviewValidationError, match="truncated"):
+        llm_review.review_diff(
+            [{"path": "src/example.py", "patch": "@@ -1 +1 @@\n+new\n"}]
+        )
+
+
+def test_review_diff_requires_nvidia_api_key(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY")
+    monkeypatch.setattr(
+        llm_review,
+        "_call_nvidia_with_retry",
+        lambda *args, **kwargs: pytest.fail("No request expected"),
+    )
+
+    with pytest.raises(NVIDIAAPIError, match="NVIDIA_API_KEY"):
+        llm_review.review_diff(
+            [{"path": "src/example.py", "patch": "@@ -1 +1 @@\n+new\n"}]
+        )
 
 
 @pytest.mark.parametrize(
