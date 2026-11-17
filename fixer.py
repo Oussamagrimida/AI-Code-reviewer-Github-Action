@@ -444,7 +444,6 @@ def _open_repository_parent(path: str):
     if (
         os.name != "posix"
         or os.open not in os.supports_dir_fd
-        or os.replace not in os.supports_dir_fd
         or not hasattr(os, "O_NOFOLLOW")
         or not hasattr(os, "O_DIRECTORY")
     ):
