@@ -7,27 +7,48 @@ not a substitute for human review.
 
 ## How it works
 
-For a pull request workflow, the Action:
+For a pull request workflow, the Action executes an intelligent multi-pass
+review pipeline:
 
-1. Fetches the pull request head and changed-file patches from the GitHub
-   REST API. The changed-files request is paginated.
-2. Splits diffs into review chunks, targeting 20,000 characters and no
-   more than two file pieces per chunk. Oversized hunks are split where
-   possible. Each chunk is sent to the NVIDIA API for a structured JSON
-   review.
-3. Parses and validates each response. A finding must use a file and an
-   added line from that chunk, and must satisfy the required schema,
-   category, severity, and confidence constraints. Invalid individual
-   findings are discarded without losing valid findings. If the response
-   itself is malformed or unusable, the run fails with a safe, actionable
-   error rather than publishing unvalidated content. Duplicate findings
-   across chunks are removed.
-4. Fetches the pull request head again. If the head SHA changed while the
-   review was being generated, it skips submission. Otherwise, it submits
-   the review against the original head SHA.
+1. **Diff ingestion & chunking**: Fetches pull request head and changed-file
+   patches from the GitHub REST API (paginated). Diffs are grouped into review
+   chunks (up to 20,000 characters and no more than two files per chunk).
+2. **Pass 1 — Structural analysis (zero API calls)**: Analyzes file types,
+   AST definitions (Python classes, functions, calls), and cross-file dependencies
+   locally before making any model calls.
+3. **Pass 2 — Correctness & logic**: Specialized prompt targeting algorithmic
+   flaws, arithmetic mistakes, inverted conditions, off-by-one errors, empty
+   inputs, and boundary conditions.
+4. **Pass 3 — Security & reliability**: Specialized prompt targeting injection,
+   path traversal, secret exposure, unhandled exceptions, and resource leaks.
+5. **Pass 4 — Conditional cross-file analysis**: When structural relationships
+   exist across multiple changed files, scans for broken interfaces, changed
+   signatures, and unadjusted callers.
+6. **Pass 5 — Synthesis & semantic deduplication**: Merges multi-pass findings,
+   resolving duplicate reports of the same underlying defect while preserving
+   independent issues. Chooses the highest severity and most actionable remediation.
+7. **Safe submission**: Verifies that findings anchor exclusively to added lines.
+   Checks pull request head SHA to avoid stale reviews and posts summary and inline
+   comments.
 
 The SHA check reduces the chance of posting stale feedback, but cannot
 eliminate a push that happens after the final check and before submission.
+
+
+
+## Enriched finding schema
+
+Findings provide structured, actionable technical feedback:
+
+- `path` & `line`: Exact file and line in the pull request diff.
+- `category`: `correctness`, `security`, `concurrency`, `performance`,
+  `resource_management`, `error_handling`, `edge_case`, or `missing_test`.
+- `severity`: `critical`, `high`, `medium`, `low`, or `info`.
+- `confidence`: Calibrated certainty score between 0.0 and 1.0.
+- `explanation`: Detailed root-cause technical analysis.
+- `impact`: Concrete runtime failure or security consequence.
+- `remediation`: Explicit code fix or architectural correction.
+- `body`: Backward-compatible summary formatted for GitHub review comments.
 
 ## API retries and review submission
 
@@ -171,9 +192,23 @@ on PR-controlled code. Restrict eligible PR authors to trusted collaborators:
 tests execute code from the PR, so repository workflow configuration and the
 test command must be trusted.
 
-`test-command` is a trusted JSON array of executable and arguments; it is
-invoked without a shell. It must not be derived from PR content. If it is
-missing or invalid, auto-fix stops without generating or pushing a fix.
+### Dual-mode auto-fix execution
+
+The auto-fix engine operates in two distinct modes depending on project setup:
+
+- **Mode 1 (Configured test suite)**: When `test-command` is provided (e.g.
+  `["python", "-m", "pytest", "-q"]`), the agent attempts fixes, executes tests
+  without a shell in a bounded retry loop (up to `max-fix-attempts`), and verifies
+  clean test passes before committing and pushing. If tests fail, attempts are
+  cleanly rolled back.
+- **Mode 2 (Basic deterministic validation)**: When `test-command` is omitted,
+  the agent proposes a fix and executes deterministic language syntax checks
+  (e.g., Python AST/compilation, JSON validation, JavaScript syntax checks).
+  - By default (`allow-unverified-push: 'false'`), changes are rolled back and
+    an informative PR comment is posted explaining the fix passed basic syntax
+    checks but was not pushed because no automated test suite was configured.
+  - When explicitly opted-in (`allow-unverified-push: 'true'`), the validated fix
+    is committed and pushed with an honest notice that only basic syntax checks ran.
 The test command has a 10-minute timeout; test output is bounded and only
 passed to the fixing agent for retries. A nonzero exit or timeout rolls back
 the current attempt and permits another attempt if any remain. Infrastructure
@@ -223,6 +258,8 @@ For focused tests, run:
 ```bash
 python -m pytest -q tests/test_review.py
 python -m pytest -q tests/test_llm_review.py
+python -m pytest -q tests/test_fixer.py
+python -m pytest -q tests/test_benchmark.py
 ```
 
 ## Known limitations

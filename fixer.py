@@ -1650,6 +1650,87 @@ def _rollback_attempt(expected_state: tuple):
         raise RuntimeError("Rollback could not be verified.")
 
 
+def _run_basic_validation(changed_files: list) -> dict:
+    """
+    Performs deterministic syntax and structural validation for changed files
+    when no dedicated test suite command is configured (Mode 2).
+    Supported checks:
+    - Python (.py): tokenize and compile() syntax verification in-memory
+    - JSON (.json): json.loads parsing verification in-memory
+    - JavaScript (.js, .mjs, .cjs): node --check syntax verification if node is available
+    - PHP (.php): php -l syntax linting if php is available
+    """
+    import tokenize
+
+    for path in changed_files:
+        if not os.path.exists(path):
+            continue
+        if path.endswith(".py"):
+            try:
+                with tokenize.open(path) as f:
+                    source = f.read()
+                compile(source, path, "exec")
+            except Exception as e:
+                return {
+                    "passed": False,
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "output": f"Python syntax check failed for {path}: {e}",
+                }
+        elif path.endswith(".json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception as e:
+                return {
+                    "passed": False,
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "output": f"JSON syntax check failed for {path}: {e}",
+                }
+        elif path.endswith((".js", ".mjs", ".cjs")):
+            import shutil
+            node_bin = shutil.which("node")
+            if node_bin:
+                res = subprocess.run(
+                    [node_bin, "--check", path],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    err = res.stderr.strip() or res.stdout.strip()
+                    return {
+                        "passed": False,
+                        "exit_code": res.returncode,
+                        "timed_out": False,
+                        "output": f"JavaScript syntax check failed for {path}:\n{err}",
+                    }
+        elif path.endswith(".php"):
+            import shutil
+            php_bin = shutil.which("php")
+            if php_bin:
+                res = subprocess.run(
+                    [php_bin, "-l", path],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    err = res.stderr.strip() or res.stdout.strip()
+                    return {
+                        "passed": False,
+                        "exit_code": res.returncode,
+                        "timed_out": False,
+                        "output": f"PHP syntax check failed for {path}:\n{err}",
+                    }
+
+    return {
+        "passed": True,
+        "exit_code": 0,
+        "timed_out": False,
+        "output": "Basic deterministic syntax checks passed.",
+    }
+
+
 def _attempt_failure_text(result: dict, attempt: int) -> str:
     if result["timed_out"]:
         reason = "The configured test command timed out."
@@ -1700,20 +1781,19 @@ def main():
         print("Invalid branch name -- skipping auto-fix.")
         return
 
-    if not os.environ.get("AUTOFIX_TEST_COMMAND", "").strip():
-        _report(
-            repo, pr_number, token,
-            "### \U0001F916 Auto-fix not started\n\n"
-            "No trusted test command is configured. No fix was generated, "
-            "tested, committed, or pushed.",
-        )
-        print("Auto-fix requires a trusted test command; none was configured.")
-        return
+    raw_test_command = os.environ.get("AUTOFIX_TEST_COMMAND", "").strip()
+    has_test_command = bool(raw_test_command)
+    test_command = None
+    allow_unverified_push = (
+        os.environ.get("AUTOFIX_ALLOW_UNVERIFIED_PUSH", "false")
+        .strip()
+        .lower()
+        in ("true", "1", "yes")
+    )
 
     try:
-        test_command = parse_test_command(
-            os.environ["AUTOFIX_TEST_COMMAND"]
-        )
+        if has_test_command:
+            test_command = parse_test_command(raw_test_command)
         max_attempts = _max_fix_attempts(
             os.environ.get("AUTOFIX_MAX_ATTEMPTS", "2")
         )
@@ -1938,7 +2018,10 @@ def main():
             initial_state = _with_current_index_metadata(
                 initial_state, state_before_test
             )
-            last_test_result = run_test_command(test_command)
+            if has_test_command:
+                last_test_result = run_test_command(test_command)
+            else:
+                last_test_result = _run_basic_validation(changed_files)
         except Exception:
             try:
                 _rollback_attempt(initial_state)
@@ -2034,15 +2117,51 @@ def main():
             return
 
         if attempt == max_attempts:
+            if has_test_command:
+                _report(
+                    repo, pr_number, token,
+                    "### \U0001F916 Auto-fix attempts exhausted\n\n"
+                    "A fix was generated, but tests failed on every attempt. "
+                    "Each failed attempt was rolled back; nothing was committed "
+                    "or pushed.",
+                )
+                print("All configured fix attempts failed validation.")
+            else:
+                _report(
+                    repo, pr_number, token,
+                    "### \U0001F916 Auto-fix attempts exhausted\n\n"
+                    "A fix was generated, but basic deterministic syntax "
+                    "validation failed on every attempt. Each failed attempt "
+                    "was rolled back; nothing was committed or pushed.",
+                )
+                print("All configured fix attempts failed basic validation.")
+            return
+
+    if not has_test_command and not allow_unverified_push:
+        try:
+            _rollback_attempt(initial_state)
+        except Exception:
             _report(
                 repo, pr_number, token,
-                "### \U0001F916 Auto-fix attempts exhausted\n\n"
-                "A fix was generated, but tests failed on every attempt. "
-                "Each failed attempt was rolled back; nothing was committed "
-                "or pushed.",
+                "### \U0001F916 Auto-fix could not safely continue\n\n"
+                "Basic validation passed but rollback could not be verified. "
+                "Manual inspection is required; no commit or push was attempted.",
             )
-            print("All configured fix attempts failed validation.")
+            print("Rollback could not be verified for unverified push.")
             return
+
+        _report(
+            repo, pr_number, token,
+            "### \U0001F916 Auto-fix generated (not pushed)\n\n"
+            "A fix was generated and passed basic deterministic syntax validation. "
+            "However, no trusted test command is configured (Mode 2) and "
+            "`allow-unverified-push` is false.\n\n"
+            "The fix was rolled back and nothing was pushed to the branch. "
+            "To push fixes without a test suite, configure `allow-unverified-push: true`, "
+            "or configure `test-command` with your project's test runner.",
+        )
+        print("Auto-fix passed basic validation but was not pushed because allow-unverified-push is false.")
+        return
 
     try:
         validate_pull_request(repo, pr_number, branch, token, expected_head_sha)
@@ -2138,14 +2257,25 @@ def main():
         print("The validated fix could not be committed and pushed.")
         return
 
-    _report(
-        repo, pr_number, token,
-        "### \U0001F916 Auto-fix pushed\n\n"
-        "A fix was generated, passed the configured tests, committed, and "
-        "successfully pushed to the verified PR branch. Please review it "
-        "before merging.",
-    )
-    print("Auto-fix passed tests, was committed, and pushed successfully.")
+    if has_test_command:
+        _report(
+            repo, pr_number, token,
+            "### \U0001F916 Auto-fix pushed\n\n"
+            "A fix was generated, passed the configured tests, committed, and "
+            "successfully pushed to the verified PR branch. Please review it "
+            "before merging.",
+        )
+        print("Auto-fix passed tests, was committed, and pushed successfully.")
+    else:
+        _report(
+            repo, pr_number, token,
+            "### \U0001F916 Auto-fix pushed (basic validation only)\n\n"
+            "A fix was generated and passed basic deterministic syntax validation. "
+            "**Note:** No automated test suite was configured to verify functionality "
+            "(`allow-unverified-push` was enabled). Please test and review these changes "
+            "carefully before merging.",
+        )
+        print("Auto-fix passed basic validation and was pushed (allow-unverified-push is true).")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 name: 'AI Code Reviewer'
 description: 'Automatically reviews pull requests using NVIDIA Nemotron, with an optional auto-fix step.'
-author: 'your-name-here'
+author: 'Grimida Oussama'
 
 inputs:
   nvidia-api-key:
@@ -21,10 +21,17 @@ inputs:
   test-command:
     description: >
       Trusted JSON argv array for the project's tests, for example
-      ["python", "-m", "pytest", "-q"]. No shell is used. Auto-fix is
-      skipped unless a test command is configured.
+      ["python", "-m", "pytest", "-q"]. No shell is used. When omitted,
+      auto-fix operates in Mode 2 with basic deterministic syntax validation.
     required: false
     default: ''
+  allow-unverified-push:
+    description: >
+      If "true" and no test-command is configured, allows committing and
+      pushing fixes that pass basic deterministic validation (e.g. language
+      syntax checks). Defaults to "false".
+    required: false
+    default: 'false'
   max-fix-attempts:
     description: 'Maximum number of fix-and-test attempts (1-5; default 2).'
     required: false
@@ -52,6 +59,7 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        ENABLE_MULTI_PASS: 'true'
 
     - name: Install auto-fix dependencies
       if: inputs.enable-autofix == 'true' && steps.review.outputs.has_bugs == 'true'
@@ -72,6 +80,7 @@ runs:
         REVIEW_ISSUES: ${{ steps.review.outputs.issues_summary }}
         AUTOFIX_TEST_COMMAND: ${{ inputs.test-command }}
         AUTOFIX_MAX_ATTEMPTS: ${{ inputs.max-fix-attempts }}
+        AUTOFIX_ALLOW_UNVERIFIED_PUSH: ${{ inputs.allow-unverified-push }}
 
 
 branding:

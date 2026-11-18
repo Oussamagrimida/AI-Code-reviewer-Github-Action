@@ -1878,14 +1878,131 @@ def test_head_change_during_test_is_not_reset_or_pushed(git_repo, monkeypatch):
 
 
 def test_main_skips_when_no_test_command_is_configured(git_repo, monkeypatch):
+    # Legacy test: without Mode 2 (allow-unverified-push absent/false),
+    # the agent still runs and generates a fix, but the fix is NOT pushed.
+    # The comment must explain that no test command is configured.
     comments = []
     _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
     monkeypatch.delenv("AUTOFIX_TEST_COMMAND")
+    # allow-unverified-push defaults to false (env var absent)
+    monkeypatch.delenv("AUTOFIX_ALLOW_UNVERIFIED_PUSH", raising=False)
+
+    commits = []
     monkeypatch.setattr(
-        fixer, "build_agent",
-        lambda *args, **kwargs: pytest.fail("agent must not run"),
+        fixer, "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
     )
 
     fixer.main()
 
-    assert any("No trusted test command" in body for body in comments)
+    # Agent ran (no "agent must not run" failure); but nothing was committed
+    assert commits == []
+    # The comment must mention that no test suite was configured
+    assert any(
+        "no test" in body.lower() or "allow-unverified-push" in body.lower()
+        or "basic" in body.lower()
+        for body in comments
+    )
+
+
+def test_mode2_fix_not_pushed_when_allow_unverified_push_is_false(
+    git_repo, monkeypatch
+):
+    """Mode 2: agent runs, basic validation passes, but push is suppressed."""
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    monkeypatch.delenv("AUTOFIX_TEST_COMMAND")
+    monkeypatch.setenv("AUTOFIX_ALLOW_UNVERIFIED_PUSH", "false")
+
+    basic_calls = []
+
+    def fake_basic_validation(changed_files):
+        basic_calls.append(changed_files)
+        return {"passed": True, "exit_code": 0, "timed_out": False, "output": "ok"}
+
+    monkeypatch.setattr(fixer, "_run_basic_validation", fake_basic_validation)
+    commits = []
+    monkeypatch.setattr(
+        fixer, "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    # Basic validation ran
+    assert basic_calls, "Expected _run_basic_validation to be called"
+    # Nothing was committed / pushed
+    assert commits == []
+    # Comment explains the situation
+    assert any(
+        "allow-unverified-push" in body.lower() or "basic" in body.lower()
+        for body in comments
+    )
+
+
+def test_mode2_fix_pushed_when_allow_unverified_push_is_true(
+    git_repo, monkeypatch
+):
+    """Mode 2: agent runs, basic validation passes, push is allowed."""
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    monkeypatch.delenv("AUTOFIX_TEST_COMMAND")
+    monkeypatch.setenv("AUTOFIX_ALLOW_UNVERIFIED_PUSH", "true")
+
+    basic_calls = []
+
+    def fake_basic_validation(changed_files):
+        basic_calls.append(changed_files)
+        return {"passed": True, "exit_code": 0, "timed_out": False, "output": "ok"}
+
+    monkeypatch.setattr(fixer, "_run_basic_validation", fake_basic_validation)
+    commits = []
+    monkeypatch.setattr(
+        fixer, "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    # Basic validation ran
+    assert basic_calls, "Expected _run_basic_validation to be called"
+    # Changes were committed
+    assert len(commits) == 1
+    # Comment mentions basic validation only
+    assert any(
+        "basic" in body.lower() or "basic validation" in body.lower()
+        for body in comments
+    )
+
+
+def test_mode2_fix_rolled_back_on_syntax_failure(
+    git_repo, monkeypatch
+):
+    """Mode 2: agent runs, but basic validation fails -> rollback, no push."""
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    monkeypatch.delenv("AUTOFIX_TEST_COMMAND")
+    monkeypatch.setenv("AUTOFIX_ALLOW_UNVERIFIED_PUSH", "true")
+
+    def fake_basic_validation(changed_files):
+        return {
+            "passed": False,
+            "exit_code": 1,
+            "timed_out": False,
+            "output": "SyntaxError: invalid syntax",
+        }
+
+    monkeypatch.setattr(fixer, "_run_basic_validation", fake_basic_validation)
+    commits = []
+    monkeypatch.setattr(
+        fixer, "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+    monkeypatch.setenv("AUTOFIX_MAX_ATTEMPTS", "1")
+
+    fixer.main()
+
+    # Nothing was committed / pushed
+    assert commits == []
+    # Rollback happened: working tree should be clean
+    assert not fixer.get_changed_files()
