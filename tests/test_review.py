@@ -1334,7 +1334,7 @@ def test_controlled_end_to_end_review_pipeline(
     assert request["headers"]["Authorization"] == "Bearer nvidia-test-key"
     assert request["timeout"] == 120
     assert request["json"]["model"] == (
-        "nvidia/nemotron-3-super-120b-a12b"
+        "nvidia/nemotron-3.5-super-vl-120b-a12b"
     )
     assert request["json"]["stream"] is False
     assert request["json"]["max_tokens"] == 8192

@@ -10,7 +10,7 @@ import requests
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-MODEL = "nvidia/nemotron-3-super-120b-a12b"
+MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 RETRYABLE_NVIDIA_STATUSES = {429, 500, 502, 503, 504}
 
 VALID_CATEGORIES = {
