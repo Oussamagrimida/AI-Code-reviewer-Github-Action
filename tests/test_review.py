@@ -601,7 +601,7 @@ def test_main_skips_review_if_pr_head_changes(monkeypatch):
         lambda *args: posted_reviews.append(args),
     )
 
-    review.main()
+    review.run()
 
     assert posted_reviews == []
 
@@ -671,6 +671,111 @@ def test_main_posts_review_when_pr_head_sha_is_unchanged(
     assert "has_bugs=true" in output
     assert "src/example.py:2" in output
     assert "Handle this changed value." in output
+
+
+def _configure_main_with_model_findings(
+    monkeypatch,
+    output_file,
+    model_result,
+    posted_reviews,
+):
+    patch = "@@ -1 +1,2 @@\n context\n+new code\n"
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("PR_NUMBER", "12")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setattr(
+        review,
+        "get_pr_info",
+        lambda *args: {"head": {"sha": "abc123"}},
+    )
+    monkeypatch.setattr(
+        review,
+        "get_changed_files",
+        lambda *args: [{"path": "src/example.py", "patch": patch}],
+    )
+    monkeypatch.setattr(
+        review.llm_review,
+        "review_diff",
+        lambda files: review.llm_review.validate_review(model_result, files),
+    )
+    monkeypatch.setattr(
+        review,
+        "post_review",
+        lambda *args: posted_reviews.append(args),
+    )
+
+
+def _model_finding(line, body):
+    return {
+        "path": "src/example.py",
+        "line": line,
+        "category": "correctness",
+        "severity": "high",
+        "confidence": 0.95,
+        "body": body,
+        "explanation": body,
+        "impact": "",
+        "remediation": "",
+    }
+
+
+def test_main_posts_valid_findings_and_ignores_invalid_findings(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    output_file = tmp_path / "github_output.txt"
+    posted_reviews = []
+    model_result = {
+        "summary": "One finding is valid.",
+        "issues": [
+            _model_finding(2, "Valid finding."),
+            _model_finding(1, "Invalid finding on an unchanged line."),
+        ],
+    }
+    _configure_main_with_model_findings(
+        monkeypatch, output_file, model_result, posted_reviews
+    )
+
+    review.main()
+
+    assert len(posted_reviews) == 1
+    posted = posted_reviews[0][-1]
+    assert [issue["body"] for issue in posted["issues"]] == [
+        "Valid finding."
+    ]
+    output = output_file.read_text(encoding="utf-8")
+    assert "has_bugs=true" in output
+    assert "Valid finding." in output
+    assert "Invalid finding" not in output
+    assert "Discarded invalid finding 2" in capsys.readouterr().out
+
+
+def test_main_finishes_without_posting_when_all_findings_are_invalid(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    output_file = tmp_path / "github_output.txt"
+    posted_reviews = []
+    model_result = {
+        "summary": "The reported finding is invalid.",
+        "issues": [
+            _model_finding(1, "Invalid finding on an unchanged line.")
+        ],
+    }
+    _configure_main_with_model_findings(
+        monkeypatch, output_file, model_result, posted_reviews
+    )
+
+    review.main()
+
+    assert posted_reviews == []
+    output = output_file.read_text(encoding="utf-8")
+    assert "has_bugs=false" in output
+    assert "issues_summary<<" in output
+    assert "No valid findings remain" in capsys.readouterr().out
 
 
 def test_run_exits_when_second_pr_info_fetch_fails(
@@ -1338,13 +1443,16 @@ def test_controlled_end_to_end_review_pipeline(
     )
     assert request["json"]["stream"] is False
     assert request["json"]["max_tokens"] == 8192
-    assert len(review_posts) == 1
-
-    comments = review_posts[0]["comments"]
-    assert [(comment["path"], comment["line"]) for comment in comments] == (
-        expected_locations
-    )
-    assert all(comment["side"] == "RIGHT" for comment in comments)
+    if expected_locations:
+        assert len(review_posts) == 1
+        comments = review_posts[0]["comments"]
+        assert [
+            (comment["path"], comment["line"])
+            for comment in comments
+        ] == expected_locations
+        assert all(comment["side"] == "RIGHT" for comment in comments)
+    else:
+        assert review_posts == []
 
 
 def test_pr_without_changed_files_skips_model_and_publishes_output(

@@ -531,6 +531,14 @@ def main():
         write_github_outputs({"issues": []})
         return
 
+    if not review_result["issues"]:
+        print(
+            "No valid findings remain after validation; "
+            "skipping review publication and auto-fix."
+        )
+        write_github_outputs(review_result)
+        return
+
     print(
         f"Found {len(review_result.get('issues', []))} "
         "issue(s). Posting review..."
