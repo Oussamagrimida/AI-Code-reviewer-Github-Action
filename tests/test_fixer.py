@@ -443,6 +443,180 @@ def _prepare_main_test(
     )
 
 
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "agent invocation",
+        "workspace application",
+        "changed-file validation",
+    ],
+)
+def test_agent_failures_log_sanitized_context_and_verify_rollback(
+    git_repo,
+    monkeypatch,
+    capsys,
+    failure_stage,
+):
+    token = "github_pat_for_test_abcdefghijklmnopqrstuvwxyz"
+    api_key = "nvapi-for-test_key_abcdefghijkl"
+    header_token = "authorization-header-secret"
+    sensitive_url = (
+        "https://user:password@example.test/api?api_key=url-secret"
+    )
+    failure_message = (
+        f"request {sensitive_url} token={token} API_KEY={api_key}\n"
+        f"Authorization: Bearer {header_token}\n"
+        + "private detail " * 100
+    )
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, token, comments)
+    monkeypatch.setenv("NVIDIA_API_KEY", api_key)
+    invocation_count = []
+
+    class FailingAgent:
+        def __init__(self, root):
+            self.root = root
+
+        def invoke(self, payload):
+            invocation_count.append(payload)
+            if failure_stage == "agent invocation":
+                raise RuntimeError(failure_message)
+            (Path(self.root) / "tracked.txt").write_text(
+                "modified by agent\n", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(
+        fixer,
+        "build_agent",
+        lambda allowed, root: FailingAgent(root),
+    )
+
+    if failure_stage == "workspace application":
+        def fail_workspace_application(agent_workspace):
+            (git_repo / "tracked.txt").write_text(
+                "partially applied\n", encoding="utf-8"
+            )
+            raise RuntimeError(failure_message)
+
+        monkeypatch.setattr(
+            fixer, "_apply_agent_workspace", fail_workspace_application
+        )
+    elif failure_stage == "changed-file validation":
+        def fail_changed_file_validation(changed_files, allowed_paths):
+            raise RuntimeError(failure_message)
+
+        monkeypatch.setattr(
+            fixer, "_verify_changes_authorized", fail_changed_file_validation
+        )
+
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda *args, **kwargs: pytest.fail("Tests must not run"),
+    )
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: pytest.fail("Changes must not be pushed"),
+    )
+
+    fixer.main()
+
+    output = capsys.readouterr().out
+    failure_log = next(
+        line for line in output.splitlines()
+        if line.startswith("Auto-fix failure")
+    )
+    assert f"[stage={failure_stage}]" in failure_log
+    assert "[type=RuntimeError]" in failure_log
+    assert "[redacted-url]" in failure_log
+    assert "Authorization: [redacted]" in failure_log
+    assert "private detail" in failure_log
+    assert len(failure_log) < 550
+    assert token not in output
+    assert api_key not in output
+    assert header_token not in output
+    assert "url-secret" not in output
+    assert len(invocation_count) == 1
+    assert comments[-1].endswith(
+        "The fixing agent failed. Its changes were rolled back; "
+        "nothing was tested, committed, or pushed."
+    )
+    assert all(
+        secret not in comments[-1]
+        for secret in (token, api_key, header_token, "url-secret")
+    )
+    assert (git_repo / "tracked.txt").read_text(
+        encoding="utf-8"
+    ) == "original\n"
+    assert fixer._git_status_entries() == []
+
+
+def test_agent_receives_only_findings_for_allowed_paths(
+    git_repo,
+    monkeypatch,
+):
+    backend_paths = ["backend/app/api/routes/items.py"]
+    for path in backend_paths:
+        source = git_repo.joinpath(*path.split("/"))
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"original\n")
+        _git(git_repo, "add", "--", path)
+    _git(git_repo, "commit", "-m", "Add backend routes")
+
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    review_issues = "\n".join(
+        [
+            "- backend/app/api/routes/items.py:87 [correctness] Update fields safely.",
+            "Impact: the update could otherwise overwrite existing data.",
+            "Remediation: validate the new value before saving.",
+            "- .github/workflows/ai-reviewer.yml:27 [security] Protect workflow.",
+            "Impact: this workflow finding must not reach the fixing agent.",
+            "Remediation: do not modify any workflow file.",
+        ]
+    )
+    authorized_finding = "\n".join(
+        [
+            "- backend/app/api/routes/items.py:87 [correctness] Update fields safely.",
+            "Impact: the update could otherwise overwrite existing data.",
+            "Remediation: validate the new value before saving.",
+        ]
+    )
+    monkeypatch.setenv("REVIEW_ISSUES", review_issues)
+    authorized_paths = []
+    agent_tasks = []
+
+    class CapturingAgent:
+        def __init__(self, root):
+            self.root = root
+
+        def invoke(self, payload):
+            agent_tasks.append(payload["messages"][0]["content"])
+
+    def build_agent(allowed_paths, root):
+        authorized_paths.extend(allowed_paths)
+        return CapturingAgent(root)
+
+    monkeypatch.setattr(fixer, "build_agent", build_agent)
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda *args, **kwargs: pytest.fail("Tests must not run"),
+    )
+
+    fixer.main()
+
+    assert authorized_paths == backend_paths
+    assert len(agent_tasks) == 1
+    assert authorized_finding in agent_tasks[0]
+    assert ".github/workflows/ai-reviewer.yml" not in agent_tasks[0]
+    assert "this workflow finding must not reach the fixing agent" not in agent_tasks[0]
+    assert "do not modify any workflow file" not in agent_tasks[0]
+    assert os.environ["REVIEW_ISSUES"] == review_issues
+    assert fixer._git_status_entries() == []
+
+
 def test_agent_summary_is_not_published_on_success(git_repo, monkeypatch):
     secret = "simulated-agent-summary-secret"
     comments = []

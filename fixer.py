@@ -50,6 +50,30 @@ def extract_allowed_paths(issues_text: str) -> list:
     return sorted(paths)
 
 
+def _filter_issues_for_allowed_paths(
+    issues_text: str,
+    allowed_paths: list,
+) -> str:
+    allowed = set(allowed_paths)
+    filtered = []
+    current_finding = []
+    current_is_allowed = False
+
+    for line in issues_text.splitlines():
+        match = re.match(r"^- (.+):[1-9][0-9]* \[[^\]]+\]", line)
+        if match:
+            if current_is_allowed:
+                filtered.extend(current_finding)
+            current_finding = [line]
+            current_is_allowed = match.group(1) in allowed
+        elif current_finding:
+            current_finding.append(line)
+
+    if current_is_allowed:
+        filtered.extend(current_finding)
+    return "\n".join(filtered)
+
+
 class ValidationError(RuntimeError):
     """A failure whose fixed message is safe to post publicly."""
 
@@ -1754,6 +1778,52 @@ def _redact_test_output(output: str, secrets: list) -> str:
     return output
 
 
+_AUTHORIZATION_HEADER_RE = re.compile(
+    r"""(?i)(\bauthorization\s*['"]?\s*:\s*['"]?)[^\r\n,]+"""
+)
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"""(?i)(\b(?:[A-Z0-9_]*(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD)"""
+    r"""|X-API-KEY)\b\s*[:=]\s*['"]?)[^,\s'"]+"""
+)
+_SENSITIVE_URL_RE = re.compile(
+    r"""(?i)\b(?:https?|ftp|ssh|git)://[^\s<>'"]+|\bgit@github\.com:[^\s<>'"]+"""
+)
+_TOKEN_FORMAT_RE = re.compile(
+    r"(?i)\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|"
+    r"nvapi-[A-Za-z0-9_-]+)\b"
+)
+_MAX_FAILURE_MESSAGE_LENGTH = 400
+
+
+def _sanitize_agent_exception_message(message: str, secrets: list) -> str:
+    sanitized = message
+    for secret in secrets:
+        if secret:
+            sanitized = sanitized.replace(secret, "[redacted]")
+    sanitized = _AUTHORIZATION_HEADER_RE.sub(
+        r"\1[redacted]", sanitized
+    )
+    sanitized = _SENSITIVE_URL_RE.sub("[redacted-url]", sanitized)
+    sanitized = _CREDENTIAL_ASSIGNMENT_RE.sub(
+        r"\1[redacted]", sanitized
+    )
+    sanitized = _TOKEN_FORMAT_RE.sub("[redacted]", sanitized)
+    sanitized = " ".join(sanitized.split())
+    if not sanitized:
+        return "(no message)"
+    if len(sanitized) > _MAX_FAILURE_MESSAGE_LENGTH:
+        return sanitized[:_MAX_FAILURE_MESSAGE_LENGTH] + "..."
+    return sanitized
+
+
+def _log_agent_exception(stage: str, error: Exception, secrets: list):
+    message = _sanitize_agent_exception_message(str(error), secrets)
+    print(
+        f"Auto-fix failure [stage={stage}] "
+        f"[type={type(error).__name__}]: {message}"
+    )
+
+
 def main():
     issues_text = os.environ.get("REVIEW_ISSUES", "").strip()
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -1815,6 +1885,19 @@ def main():
             "No fix was generated, tested, committed, or pushed.",
         )
         print("No safe authorized file paths were identified.")
+        return
+
+    agent_issues_text = _filter_issues_for_allowed_paths(
+        issues_text, allowed_paths
+    )
+    if not agent_issues_text:
+        _report(
+            repo, pr_number, token,
+            "### \U0001F916 Auto-fix not started\n\n"
+            "No safe, authorized finding details could be identified. "
+            "No fix was generated, tested, committed, or pushed.",
+        )
+        print("No safe authorized finding details were identified.")
         return
 
     try:
@@ -1922,7 +2005,8 @@ def main():
     for attempt in range(1, max_attempts + 1):
         task = (
             "Fix these specific issues found in code review. Make only the "
-            f"minimal changes needed, in the allowed file(s) only:\n\n{issues_text}"
+            f"minimal changes needed, in the allowed file(s) only:\n\n"
+            f"{agent_issues_text}"
         )
         if feedback:
             task += (
@@ -1931,9 +2015,12 @@ def main():
                 f"{feedback}"
             )
 
+        failure_stage = "agent invocation"
         try:
             agent.invoke({"messages": [{"role": "user", "content": task}]})
+            failure_stage = "workspace application"
             _apply_agent_workspace(agent_workspace)
+            failure_stage = "changed-file validation"
             changed_files = get_changed_files()
             if not changed_files:
                 if not generated_any:
@@ -1956,7 +2043,8 @@ def main():
 
             generated_any = True
             _verify_changes_authorized(changed_files, allowed_paths)
-        except ValidationError:
+        except ValidationError as error:
+            _log_agent_exception(failure_stage, error, [token, api_key])
             try:
                 _rollback_attempt(initial_state)
             except Exception:
@@ -1978,7 +2066,8 @@ def main():
             )
             print("Unauthorized changes detected and rolled back.")
             return
-        except Exception:
+        except Exception as error:
+            _log_agent_exception(failure_stage, error, [token, api_key])
             try:
                 _rollback_attempt(initial_state)
             except Exception:
