@@ -70,6 +70,10 @@ class ReviewValidationError(ValueError):
     """Raised when the LLM response is not safe to publish as a review."""
 
 
+class NVIDIAResponseTruncatedError(ReviewValidationError):
+    """Raised when NVIDIA reports that a completion was truncated."""
+
+
 class NVIDIAAPIError(RuntimeError):
     """Raised when NVIDIA cannot return a usable API response."""
 
@@ -1427,7 +1431,7 @@ def _call_model_for_prompt(
         )
 
     if finish_reason == "length":
-        raise ReviewValidationError(
+        raise NVIDIAResponseTruncatedError(
             "NVIDIA response was truncated; reduce the diff size and retry."
         )
 
@@ -1543,7 +1547,7 @@ def _run_multi_pass_review(files: list, chunks: list, headers: dict) -> dict:
     # Shared budget tracker: counts every API call including repair attempts
     budget_tracker = {"calls": 0, "max_calls": 16}
 
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
         diff_text = "\n\n".join(
             f"--- FILE: {f['path']} ---\n{f['patch']}"
             for f in chunk
@@ -1559,26 +1563,47 @@ def _run_multi_pass_review(files: list, chunks: list, headers: dict) -> dict:
         )
 
         if not chunk_has_code:
-            if budget_tracker["calls"] < budget_tracker["max_calls"]:
-                review = _call_model_for_prompt(SYSTEM_PROMPT, diff_text, headers, budget_tracker)
-                validated = validate_review(review, chunk)
-                summaries.append(validated["summary"])
-                all_issues.extend(validated["issues"])
-            continue
+            primary_passes = [("general", SYSTEM_PROMPT)]
+        else:
+            primary_passes = [
+                ("correctness", CORRECTNESS_PROMPT),
+                ("security and reliability", SECURITY_RELIABILITY_PROMPT),
+            ]
 
-        # Pass 2: Deep Correctness & Logic
-        if budget_tracker["calls"] < budget_tracker["max_calls"]:
-            review_corr = _call_model_for_prompt(CORRECTNESS_PROMPT, diff_text, headers, budget_tracker)
-            validated_corr = validate_review(review_corr, chunk)
-            summaries.append(validated_corr["summary"])
-            all_issues.extend(validated_corr["issues"])
+        completed_primary_passes = 0
+        truncated_passes = []
+        for pass_name, prompt in primary_passes:
+            if budget_tracker["calls"] >= budget_tracker["max_calls"]:
+                continue
+            try:
+                pass_review = _call_model_for_prompt(
+                    prompt, diff_text, headers, budget_tracker
+                )
+            except NVIDIAResponseTruncatedError as exc:
+                truncated_passes.append(exc)
+                print(
+                    f"Skipping {pass_name} pass for diff chunk "
+                    f"{chunk_index}/{len(chunks)}: response was truncated."
+                )
+                continue
 
-        # Pass 3: Security & Reliability
-        if budget_tracker["calls"] < budget_tracker["max_calls"]:
-            review_sec = _call_model_for_prompt(SECURITY_RELIABILITY_PROMPT, diff_text, headers, budget_tracker)
-            validated_sec = validate_review(review_sec, chunk)
-            summaries.append(validated_sec["summary"])
-            all_issues.extend(validated_sec["issues"])
+            validated_pass = validate_review(pass_review, chunk)
+            completed_primary_passes += 1
+            summaries.append(validated_pass["summary"])
+            all_issues.extend(validated_pass["issues"])
+
+        if completed_primary_passes == 0:
+            if truncated_passes:
+                raise NVIDIAResponseTruncatedError(
+                    f"No primary pass completed for diff chunk "
+                    f"{chunk_index}/{len(chunks)}; all attempted primary "
+                    "passes were truncated."
+                ) from truncated_passes[-1]
+            raise ReviewValidationError(
+                f"No primary pass completed for diff chunk "
+                f"{chunk_index}/{len(chunks)} because the API call budget "
+                "was exhausted."
+            )
 
     # Pass 4: Conditional Cross-File Analysis
     if structure["has_cross_file_relationships"] and len(files) > 1 and budget_tracker["calls"] < budget_tracker["max_calls"]:
@@ -1596,8 +1621,11 @@ def _run_multi_pass_review(files: list, chunks: list, headers: dict) -> dict:
             all_issues.extend(validated_cross["issues"])
             if validated_cross.get("summary"):
                 summaries.append(validated_cross["summary"])
-        except ReviewValidationError:
-            pass
+        except NVIDIAResponseTruncatedError:
+            print(
+                "Skipping cross-file pass for all files: "
+                "NVIDIA response was truncated."
+            )
 
     # Pass 5: Synthesis & Semantic Deduplication
     deduped_issues = _semantic_deduplicate_issues(all_issues)

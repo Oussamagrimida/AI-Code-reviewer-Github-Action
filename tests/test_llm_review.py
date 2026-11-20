@@ -1724,7 +1724,7 @@ def test_review_diff_rejects_truncated_completion(monkeypatch):
         },
     )
 
-    with pytest.raises(ReviewValidationError, match="truncated"):
+    with pytest.raises(llm_review.NVIDIAResponseTruncatedError, match="truncated"):
         llm_review.review_diff(
             [{"path": "src/example.py", "patch": "@@ -1 +1 @@\n+new\n"}]
         )
@@ -2252,6 +2252,140 @@ def test_multi_pass_keeps_independent_correctness_defects(monkeypatch):
     )
     assert "is_even" in explanations
     assert "calculate_average" in explanations
+
+
+def test_multi_pass_keeps_valid_findings_when_security_pass_is_truncated(
+    monkeypatch,
+    capsys,
+):
+    calls = []
+
+    def fake_call(prompt, diff_text, headers, budget_tracker):
+        calls.append(prompt)
+        budget_tracker["calls"] += 1
+        if prompt == llm_review.CORRECTNESS_PROMPT:
+            return {
+                "summary": "One valid correctness issue.",
+                "issues": [
+                    {
+                        "path": "src/example.py",
+                        "line": 2,
+                        "category": "correctness",
+                        "severity": "high",
+                        "confidence": 0.95,
+                        "explanation": "The added line returns the wrong value.",
+                        "impact": "",
+                        "remediation": "",
+                    },
+                    {
+                        "path": "src/example.py",
+                        "line": 3,
+                        "category": "correctness",
+                        "severity": "high",
+                        "confidence": 0.95,
+                        "explanation": "This context line is unchanged.",
+                        "impact": "",
+                        "remediation": "",
+                    },
+                ],
+            }
+        raise llm_review.NVIDIAResponseTruncatedError(
+            "NVIDIA response was truncated."
+        )
+
+    monkeypatch.setattr(llm_review, "_call_model_for_prompt", fake_call)
+
+    result = llm_review.review_diff(FILES, multi_pass=True)
+
+    assert calls == [
+        llm_review.CORRECTNESS_PROMPT,
+        llm_review.SECURITY_RELIABILITY_PROMPT,
+    ]
+    assert [issue["line"] for issue in result["issues"]] == [2]
+    assert "wrong value" in result["issues"][0]["explanation"]
+    output = capsys.readouterr().out
+    assert "Discarded invalid finding 2" in output
+    assert "correctness pass for diff chunk 1/1" not in output
+    assert "security and reliability pass for diff chunk 1/1" in output
+
+
+def test_multi_pass_counts_empty_success_when_other_pass_is_truncated(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_call(prompt, diff_text, headers, budget_tracker):
+        calls.append(prompt)
+        budget_tracker["calls"] += 1
+        if prompt == llm_review.CORRECTNESS_PROMPT:
+            return {"summary": "No correctness defects.", "issues": []}
+        raise llm_review.NVIDIAResponseTruncatedError(
+            "NVIDIA response was truncated."
+        )
+
+    monkeypatch.setattr(llm_review, "_call_model_for_prompt", fake_call)
+
+    result = llm_review.review_diff(FILES, multi_pass=True)
+
+    assert calls == [
+        llm_review.CORRECTNESS_PROMPT,
+        llm_review.SECURITY_RELIABILITY_PROMPT,
+    ]
+    assert result["issues"] == []
+    assert "No correctness defects." in result["summary"]
+
+
+def test_multi_pass_fails_when_all_primary_passes_are_truncated(
+    monkeypatch,
+    capsys,
+):
+    calls = []
+
+    def fake_call(prompt, diff_text, headers, budget_tracker):
+        calls.append(prompt)
+        budget_tracker["calls"] += 1
+        raise llm_review.NVIDIAResponseTruncatedError(
+            "NVIDIA response was truncated."
+        )
+
+    monkeypatch.setattr(llm_review, "_call_model_for_prompt", fake_call)
+
+    with pytest.raises(
+        llm_review.NVIDIAResponseTruncatedError,
+        match="diff chunk 1/1",
+    ):
+        llm_review.review_diff(FILES, multi_pass=True)
+
+    assert calls == [
+        llm_review.CORRECTNESS_PROMPT,
+        llm_review.SECURITY_RELIABILITY_PROMPT,
+    ]
+    output = capsys.readouterr().out
+    assert "correctness pass for diff chunk 1/1" in output
+    assert "security and reliability pass for diff chunk 1/1" in output
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ReviewValidationError("malformed pass response"),
+        NVIDIAAPIError("NVIDIA request failed"),
+        RuntimeError("unexpected pass failure"),
+    ],
+)
+def test_multi_pass_propagates_non_truncation_errors(monkeypatch, failure):
+    def fake_call(prompt, diff_text, headers, budget_tracker):
+        budget_tracker["calls"] += 1
+        if prompt == llm_review.CORRECTNESS_PROMPT:
+            return {"summary": "No correctness defects.", "issues": []}
+        raise failure
+
+    monkeypatch.setattr(llm_review, "_call_model_for_prompt", fake_call)
+
+    with pytest.raises(type(failure), match=str(failure)) as caught:
+        llm_review.review_diff(FILES, multi_pass=True)
+
+    assert caught.value is failure
 
 
 def test_multi_pass_deduplicates_and_normalizes_across_passes(monkeypatch):
