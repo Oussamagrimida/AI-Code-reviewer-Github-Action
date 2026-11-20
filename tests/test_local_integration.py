@@ -395,7 +395,7 @@ def test_real_orchestration_cross_file_triggering(tmp_path, monkeypatch):
 def test_live_nvidia_review_with_real_api(tmp_path):
     """
     Sends the 5-defect buggy project diffs directly to the real hosted NVIDIA API
-    using the model `nvidia/nemotron-3.5-lightning-30b-a3b`.
+    using the model `nvidia/nemotron-3-super-120b-a12b`.
     Skipped if NVIDIA_API_KEY is not set in the environment.
     """
     api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
