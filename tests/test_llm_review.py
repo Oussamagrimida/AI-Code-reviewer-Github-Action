@@ -254,6 +254,38 @@ def test_context_line_is_discarded():
     assert validate_review(review, FILES)["issues"] == []
 
 
+def test_added_line_anchor_does_not_ground_unchanged_permission_claim():
+    files = [
+        {
+            "path": "app/routes/items.py",
+            "patch": (
+                "@@ -20,4 +20,5 @@\n"
+                " def update_item(item_id, payload, current_user, db):\n"
+                "     if item.owner_id != current_user.id:\n"
+                "         raise HTTPException(status_code=403)\n"
+                "+    item.name = payload.name\n"
+                "     return item\n"
+            ),
+        }
+    ]
+    review = valid_review()
+    finding = review["issues"][0]
+    finding.update(
+        {
+            "path": "app/routes/items.py",
+            "line": 23,
+            "category": "security",
+            "explanation": (
+                "The update_item permission check is inverted by this change."
+            ),
+        }
+    )
+
+    assert llm_review._added_lines(files[0]["patch"]) == {23}
+    # Line validation accepts this anchor; it cannot establish the claim's truth.
+    assert validate_review(review, files)["issues"] == [finding]
+
+
 def test_deleted_line_is_discarded():
     review = valid_review()
 
@@ -2145,6 +2177,28 @@ def test_all_review_passes_share_the_same_output_schema():
     )
     assert '"explanation", "impact", and "remediation"' in (
         llm_review.FINDING_OUTPUT_CONTRACT
+    )
+
+
+def test_prompts_require_before_after_and_uniqueness_reasoning():
+    contract = " ".join(llm_review.FINDING_OUTPUT_CONTRACT.split())
+    assert (
+        "compare the removed (-) code with the added (+) code"
+        in contract
+    )
+    assert (
+        "distinguish excluding the current user's own record from allowing "
+        "another user's duplicate value"
+    ) in contract
+    security_prompt = " ".join(
+        llm_review.SECURITY_RELIABILITY_PROMPT.split()
+    )
+    assert "an added line introduces or weakens the vulnerable behavior" in (
+        security_prompt
+    )
+    assert (
+        "do not attribute an unchanged permission check to the change"
+        in security_prompt
     )
 
 

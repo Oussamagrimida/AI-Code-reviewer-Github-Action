@@ -87,6 +87,14 @@ empty string for "impact" or "remediation" when there is no additional detail.
 Do not add fields or substitute "body" or "suggested_remediation". Keep the
 category within the values allowed for this pass. Continue to report only
 added-line locations.
+
+Before reporting a regression, compare the removed (-) code with the added (+)
+code. Verify that an added line causes the claimed behavior; a nearby changed
+line is not sufficient evidence. Do not describe unchanged context as modified.
+For uniqueness checks, trace the full predicate and distinguish excluding the
+current user's own record from allowing another user's duplicate value. Report
+a duplicate-value vulnerability only if the modified code fails to reject a
+conflicting record belonging to someone else.
 """
 
 
@@ -261,6 +269,9 @@ defensive error handling without a demonstrated vulnerability or reliability
 failure in the changed code.
 Do not report catching open() failures unless the changed code establishes a
 required recovery behavior.
+For security findings, verify that an added line introduces or weakens the
+vulnerable behavior; do not attribute an unchanged permission check to the
+change.
 
 Actively check for:
 1. Injections: SQL injection, command injection, path traversal (e.g. unvalidated file paths, `../`), template injection, regex DoS (ReDoS), XSS.
