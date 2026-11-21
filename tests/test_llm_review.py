@@ -334,9 +334,9 @@ def test_deletion_caused_defect_anchors_to_added_replacement_line():
 
     assert validate_review(review, files)["issues"][0]["line"] == 29
 
-    deleted_line_finding = dict(finding, line=32)
-    review["issues"] = [deleted_line_finding]
-    assert validate_review(review, files)["issues"] == []
+    for invalid_line in (30, 32, 33):
+        review["issues"] = [dict(finding, line=invalid_line)]
+        assert validate_review(review, files)["issues"] == []
 
 
 def test_unexpected_issue_field_is_discarded(capsys):
@@ -721,6 +721,15 @@ def test_system_prompt_contains_severity_definitions():
     assert "medium:" in llm_review.SYSTEM_PROMPT
     assert "low:" in llm_review.SYSTEM_PROMPT
     assert "info:" in llm_review.SYSTEM_PROMPT
+
+
+def test_correctness_prompt_anchors_removed_filter_to_added_replacement():
+    prompt = " ".join(llm_review.CORRECTNESS_PROMPT.split())
+
+    assert "removed owner filter from a count query" in prompt
+    assert "added replacement query line (line 29 in this example)" in prompt
+    assert "later query-use lines (lines 30 or 33)" in prompt
+    assert "unchanged context, or the deleted filter" in prompt
 
 
 def test_all_review_prompts_require_structured_summary_findings_and_added_anchors():
