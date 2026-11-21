@@ -145,13 +145,18 @@ def test_review_with_only_invalid_findings_keeps_safe_summary():
 def test_invalid_finding_reports_added_line_rejection_reason(capsys):
     review = valid_review()
     review["issues"][0]["line"] = 3
+    secret_body = "Do not log this API key: test-secret-value"
+    review["issues"][0]["body"] = secret_body
 
     validate_review(review, FILES)
 
+    output = capsys.readouterr().out
     assert (
-        "Discarded invalid finding 1: "
+        "Discarded invalid finding 1 at src/example.py:3: "
         "Issue 1 does not point to an added line."
-    ) in capsys.readouterr().out
+    ) in output
+    assert secret_body not in output
+    assert "test-secret-value" not in output
 
 
 def test_empty_issue_list_is_valid():
@@ -292,6 +297,46 @@ def test_deleted_line_is_discarded():
     review["issues"][0]["line"] = 10
 
     assert validate_review(review, FILES)["issues"] == []
+
+
+def test_deletion_caused_defect_anchors_to_added_replacement_line():
+    files = [
+        {
+            "path": "backend/app/api/routes/items.py",
+            "patch": (
+                "@@ -28,7 +28,3 @@\n"
+                "     else:\n"
+                "-        count_statement = (\n"
+                "-            select(func.count())\n"
+                "-            .select_from(Item)\n"
+                "-            .where(Item.owner_id == current_user.id)\n"
+                "-        )\n"
+                "+        count_statement = select(func.count()).select_from(Item)\n"
+                "         count = session.exec(count_statement).one()\n"
+            ),
+        }
+    ]
+    assert _added_lines(files[0]["patch"]) == {29}
+
+    finding = dict(
+        valid_review()["issues"][0],
+        path=files[0]["path"],
+        line=29,
+        body=(
+            "The replacement count query no longer filters by the current "
+            "user's owner_id."
+        ),
+    )
+    review = {
+        "summary": "The count query no longer scopes results to the owner.",
+        "issues": [finding],
+    }
+
+    assert validate_review(review, files)["issues"][0]["line"] == 29
+
+    deleted_line_finding = dict(finding, line=32)
+    review["issues"] = [deleted_line_finding]
+    assert validate_review(review, files)["issues"] == []
 
 
 def test_unexpected_issue_field_is_discarded(capsys):
@@ -676,6 +721,24 @@ def test_system_prompt_contains_severity_definitions():
     assert "medium:" in llm_review.SYSTEM_PROMPT
     assert "low:" in llm_review.SYSTEM_PROMPT
     assert "info:" in llm_review.SYSTEM_PROMPT
+
+
+def test_all_review_prompts_require_structured_summary_findings_and_added_anchors():
+    prompts = (
+        llm_review.SYSTEM_PROMPT,
+        llm_review.CORRECTNESS_PROMPT,
+        llm_review.SECURITY_RELIABILITY_PROMPT,
+        llm_review.CROSS_FILE_PROMPT,
+    )
+
+    for prompt in prompts:
+        normalized_prompt = " ".join(prompt.split())
+        assert (
+            "Every concrete defect stated in the summary must also appear "
+            "as a corresponding structured issue"
+        ) in normalized_prompt
+        assert "corresponding added replacement line" in normalized_prompt
+
 
 @pytest.mark.parametrize(
     "confidence",

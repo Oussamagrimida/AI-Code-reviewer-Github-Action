@@ -92,9 +92,17 @@ Do not add fields or substitute "body" or "suggested_remediation". Keep the
 category within the values allowed for this pass. Continue to report only
 added-line locations.
 
+Every concrete defect stated in the summary must also appear as a corresponding
+structured issue in "issues"; do not report an actionable defect only in the
+summary.
+
 Before reporting a regression, compare the removed (-) code with the added (+)
 code. Verify that an added line causes the claimed behavior; a nearby changed
 line is not sufficient evidence. Do not describe unchanged context as modified.
+When a regression is caused by deleted or replaced code, anchor it to the
+corresponding added replacement line using its new-file line number, not to the
+deleted line or unchanged context. If there is no corresponding added line, do
+not report the finding.
 For uniqueness checks, trace the full predicate and distinguish excluding the
 current user's own record from allowing another user's duplicate value. Report
 a duplicate-value vulnerability only if the modified code fails to reject a
@@ -655,6 +663,21 @@ def _added_lines(patch: str) -> set[int]:
     return added
 
 
+def _rejected_finding_location(issue, files_by_path) -> str:
+    if not isinstance(issue, dict):
+        return "<unknown>:<invalid>"
+
+    path = issue.get("path")
+    if not isinstance(path, str) or path not in files_by_path:
+        path = "<unknown>"
+
+    line = issue.get("line")
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        line = "<invalid>"
+
+    return f"{path}:{line}"
+
+
 def validate_review(review: dict, files: list) -> dict:
     if not isinstance(review, dict):
         raise ReviewValidationError(
@@ -717,7 +740,11 @@ def validate_review(review: dict, files: list) -> dict:
             )
         except ReviewValidationError as exc:
             rejected_count += 1
-            print(f"Discarded invalid finding {index + 1}: {exc}")
+            location = _rejected_finding_location(issue, files_by_path)
+            print(
+                f"Discarded invalid finding {index + 1} at {location}: "
+                f"{exc}"
+            )
 
     if rejected_count:
         print(
