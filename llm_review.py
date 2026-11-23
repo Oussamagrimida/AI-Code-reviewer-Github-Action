@@ -103,6 +103,10 @@ When a regression is caused by deleted or replaced code, anchor it to the
 corresponding added replacement line using its new-file line number, not to the
 deleted line or unchanged context. If there is no corresponding added line, do
 not report the finding.
+For example, if a removed owner filter from a count query is replaced by an
+added unfiltered count query, anchor the finding to the added replacement
+query line (line 29 in this example), not later query-use lines (lines 30 or
+33), unchanged context, or the deleted filter.
 For uniqueness checks, trace the full predicate and distinguish excluding the
 current user's own record from allowing another user's duplicate value. Report
 a duplicate-value vulnerability only if the modified code fails to reject a
@@ -225,11 +229,6 @@ Concrete failures such as division by zero for an accepted zero divisor remain
 in scope.
 Do not recommend catching exceptions from open() solely because the operation
 may fail due to permissions or I/O.
-
-For example, if a removed owner filter from a count query is replaced by an
-added unfiltered count query, anchor the finding to the added replacement
-query line (line 29 in this example). Do not anchor it to later query-use lines
-(lines 30 or 33), unchanged context, or the deleted filter.
 
 Actively check for:
 1. Arithmetic errors: wrong operators, incorrect calculations, operator precedence, division by zero (/ 0, ZeroDivisionError, NaN, modulo by zero).

@@ -723,13 +723,20 @@ def test_system_prompt_contains_severity_definitions():
     assert "info:" in llm_review.SYSTEM_PROMPT
 
 
-def test_correctness_prompt_anchors_removed_filter_to_added_replacement():
-    prompt = " ".join(llm_review.CORRECTNESS_PROMPT.split())
+def test_all_review_prompts_anchor_removed_filter_to_added_replacement():
+    prompts = (
+        llm_review.SYSTEM_PROMPT,
+        llm_review.CORRECTNESS_PROMPT,
+        llm_review.SECURITY_RELIABILITY_PROMPT,
+        llm_review.CROSS_FILE_PROMPT,
+    )
 
-    assert "removed owner filter from a count query" in prompt
-    assert "added replacement query line (line 29 in this example)" in prompt
-    assert "later query-use lines (lines 30 or 33)" in prompt
-    assert "unchanged context, or the deleted filter" in prompt
+    for prompt in prompts:
+        normalized_prompt = " ".join(prompt.split())
+        assert "removed owner filter from a count query" in normalized_prompt
+        assert "added replacement query line (line 29 in this example)" in normalized_prompt
+        assert "later query-use lines (lines 30 or 33)" in normalized_prompt
+        assert "unchanged context, or the deleted filter" in normalized_prompt
 
 
 def test_all_review_prompts_require_structured_summary_findings_and_added_anchors():

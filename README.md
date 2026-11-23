@@ -1,107 +1,119 @@
 # AI Code Reviewer
 
-A GitHub Action that reviews pull request diffs with NVIDIA Nemotron and
-publishes a GitHub pull request review with a summary and, when possible,
-inline comments. Review results are checked before submission; they are
-not a substitute for human review.
+This repository contains a GitHub Action that reviews pull-request diffs with
+NVIDIA Nemotron and can optionally propose and push bounded fixes. Review
+findings are validated before publication, and Auto-Fix is disabled by
+default. Neither model output nor passing tests replace human review.
 
-## How it works
+## 1. Purpose and operating model
 
-For a pull request workflow, the Action executes an intelligent multi-pass
-review pipeline:
+The Reviewer and Auto-Fixer are separate stages connected by a validated JSON
+finding contract. The Reviewer decides what changed and reports concrete
+defects. The Auto-Fixer receives only eligible findings on authorized paths;
+it does not re-review the repository or expand its own permissions.
 
-1. **Diff ingestion & chunking**: Fetches pull request head and changed-file
-   patches from the GitHub REST API (paginated). Diffs are grouped into review
-   chunks (up to 20,000 characters and no more than two files per chunk).
-2. **Pass 1 — Structural analysis (zero API calls)**: Analyzes file types,
-   AST definitions (Python classes, functions, calls), and cross-file dependencies
-   locally before making any model calls.
-3. **Pass 2 — Correctness & logic**: Specialized prompt targeting algorithmic
-   flaws, arithmetic mistakes, inverted conditions, off-by-one errors, empty
-   inputs, and boundary conditions.
-4. **Pass 3 — Security & reliability**: Specialized prompt targeting injection,
-   path traversal, secret exposure, unhandled exceptions, and resource leaks.
-5. **Pass 4 — Conditional cross-file analysis**: When structural relationships
-   exist across multiple changed files, scans for broken interfaces, changed
-   signatures, and unadjusted callers.
-6. **Pass 5 — Synthesis & semantic deduplication**: Merges multi-pass findings,
-   resolving duplicate reports of the same underlying defect while preserving
-   independent issues. Chooses the highest severity and most actionable remediation.
-7. **Safe submission**: Verifies that findings anchor exclusively to added lines.
-   Checks pull request head SHA to avoid stale reviews and posts summary and inline
-   comments.
+Auto-Fix is intended for carefully controlled, same-repository pull requests.
+It is not a general-purpose sandbox or an unattended merge mechanism.
 
-The SHA check reduces the chance of posting stale feedback, but cannot
-eliminate a push that happens after the final check and before submission.
+## 2. End-to-end pipeline
 
+The workflow is:
 
+1. **Collect context:** `review.py` fetches pull-request metadata and changed
+   file patches from GitHub. It skips files without a reviewable patch.
+2. **Review:** `llm_review.py` chunks the diff and runs correctness and
+   security/reliability passes, with conditional cross-file analysis.
+3. **Validate findings:** each finding is checked against the supplied diff,
+   including strict added-line anchoring, required values, category and
+   severity, and safe output shape. Similar reports are deduplicated without
+   intentionally merging independent defects.
+4. **Publish and hand off:** `review.py` posts validated findings and emits a
+   separate machine-readable Auto-Fix contract through `GITHUB_OUTPUT`.
+   `action.yml` passes that contract to `fixer.py`.
+5. **Plan and generate a patch:** the fixer parses the contract, confirms the
+   PR and checkout identity, and gives the coding agent copies of authorized
+   files plus only the validated findings.
+6. **Validate and test:** changes are copied back only after workspace
+   validation, then checked for path, file, and patch bounds. A configured
+   test command runs without a shell.
+7. **Verify and decide:** a separate model call checks each finding against
+   before/after code and the exact patch. Commit and push are allowed only
+   after the required gates succeed.
 
-## Enriched finding schema
+Failures are fail-closed: invalid contracts, unsafe changes, failed tests,
+uncertain verification, changed PR heads, and unverified rollback prevent a
+push.
 
-Findings provide structured, actionable technical feedback:
+## 3. Reviewer behavior and finding schema
 
-- `path` & `line`: Exact file and line in the pull request diff.
-- `category`: `correctness`, `security`, `concurrency`, `performance`,
-  `resource_management`, `error_handling`, `edge_case`, or `missing_test`.
-- `severity`: `critical`, `high`, `medium`, `low`, or `info`.
-- `confidence`: Calibrated certainty score between 0.0 and 1.0.
-- `explanation`: Detailed root-cause technical analysis.
-- `impact`: Concrete runtime failure or security consequence.
-- `remediation`: Explicit code fix or architectural correction.
-- `body`: Backward-compatible summary formatted for GitHub review comments.
+The Reviewer operates on the changed diff, not the entire repository. It uses
+specialized prompts to inspect correctness and logic, security and
+reliability, and (when relevant) cross-file interface consistency. The
+multi-pass prompts share required output fields and instruct the model to
+continue through changed functions rather than stop after the first defect.
 
-## API retries and review submission
+A validated review issue includes:
 
-- GitHub GET requests retry timeouts, connection errors, and HTTP 429,
-  500, 502, 503, or 504 responses, up to four total attempts, waiting 5,
-  10, then 15 seconds between attempts unless a numeric `Retry-After`
-  header is present (capped at 60 seconds). Other HTTP errors are
-  reported without exposing response bodies or credentials.
-- NVIDIA API requests retry network timeouts, connection errors, and
-  HTTP 429, 500, 502, 503, or 504 responses, up to four total attempts.
-  Numeric `Retry-After` values are honored up to 60 seconds; otherwise
-  requests wait 5, 10, then 15 seconds. Permanent errors such as HTTP
-  410 are not retried. A timeout or connection failure can be ambiguous:
-  the provider may have received the request, so retries may result in
-  repeated inference work or charges.
-- GitHub review POST requests retry only explicit rate-limit responses
-  (HTTP 429 or an HTTP 403 with the rate-limit header), at most twice,
-  honoring numeric `Retry-After` values up to 60 seconds. They are not
-  retried after timeouts, connection errors, or server errors because a
-  lost response can leave the submission outcome uncertain; manually
-  rerunning the workflow can post another review.
-- If a review with inline comments receives HTTP 400 or 422 and GitHub's
-  structured error response identifies an invalid
-  `PullRequestReviewComment` field (such as `line`, `path`, `position`,
-  `side`, or `subject_type`), the Action makes one summary-only fallback
-  submission with the findings listed in its body. Unrelated or
-  unrecognized errors propagate instead of triggering that fallback.
-  Failure of the fallback also propagates.
+- `path` and `line`: the file and validated added-line location.
+- `category` and `severity`: the issue classification and impact level.
+- `confidence`: the model's confidence, bounded from 0 to 1.
+- `explanation`, `impact`, and `remediation`: the root cause, consequence,
+  and suggested correction.
+- `body`: a formatted, backward-compatible comment body for GitHub review.
 
-## NVIDIA hosted API configuration
+The model must anchor a regression caused by a removed or replaced statement
+to the corresponding added replacement line. Deleted lines and unchanged
+context are rejected as locations. Invalid individual findings are discarded;
+malformed responses and API failures remain review failures.
 
-The configured hosted model is
-`nvidia/nemotron-3.5-lightning-30b-a3b`, called through
+## 4. Review chunking, validation, and outputs
+
+Diffs are grouped into chunks of at most 20,000 characters and at most two
+files per chunk. The multi-pass review has a 16-call logical model budget per
+review run, including output-repair calls. A truncated primary pass is skipped
+when another pass can still review the chunk; successful findings are retained.
+If all primary passes for a chunk are truncated, the review fails rather than
+claiming a complete review.
+
+Finding validation checks that paths belong to supplied diffs and line
+numbers are added lines. GitHub publication also checks that the PR head has
+not changed during review. If no valid findings remain, the Action skips
+review publication and emits `has_bugs=false`; invalid findings are not
+published.
+
+The Auto-Fix output is not the human-readable markdown summary. It is a
+single-line JSON array written as the `autofix_findings` output. This avoids
+parsing display text as instructions or as a source of permissions.
+
+## 5. Model responsibilities and NVIDIA API
+
+All three inference roles use the same model identifier:
+
+- **Reviewer:** `nvidia/nemotron-3.5-super-vl-120b-a12b`, configured by
+  `llm_review.py`.
+- **Independent verification:** uses the Reviewer model through
+  `llm_review.py`; it receives the finding, before/after excerpts, and exact
+  patch and returns a strict structured decision.
+- **Auto-Fixer coding agent:** `nvidia/nemotron-3.5-super-vl-120b-a12b`,
+  configured in `fixer.py`.
+
+The calls use NVIDIA's OpenAI-compatible endpoint
 `https://integrate.api.nvidia.com/v1/chat/completions` with Bearer
-authentication. The request uses the OpenAI-compatible `messages` format,
-`temperature`, `max_tokens: 8192`, `stream: false`, and
-`chat_template_kwargs.enable_thinking: false`. NVIDIA's current
-[model API reference](https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b/apireference)
-documents this model identifier, endpoint, Bearer authentication, request
-format, and `choices[0].message.content` response shape.
+authentication. Review and verification use the shared client configuration;
+the coding agent is configured through LangChain's OpenAI-compatible client.
+Model identifiers do not guarantee that a model is enabled for a particular
+key, account, or region. Confirm availability for the Action's NVIDIA key
+before rollout. Unit tests do not make live NVIDIA requests.
 
-An identifier in code or in NVIDIA's catalog does not guarantee that the
-hosted endpoint is enabled for a particular API key, account, or region.
-Before rollout, verify the model is currently available to the Action's
-NVIDIA key in the hosted API catalog and make a real authenticated
-non-streaming request. HTTP 410 should be treated as a model/endpoint
-availability or configuration issue, not retried. This project does not
-make live NVIDIA requests during unit or integration tests.
+The reviewer retries selected transient API failures with bounded backoff.
+HTTP 410 is not retried. Network failures can have an ambiguous outcome and
+may cause repeated inference work or charges. GitHub review publication
+retries only explicit rate limits; it does not blindly retry after an
+ambiguous timeout or connection loss.
 
-## Use the Action
+## 6. Review-only setup
 
-Create a workflow such as `.github/workflows/ai-review.yml` in the
-repository where pull requests will be reviewed:
+Add a workflow in the repository to be reviewed:
 
 ```yaml
 name: AI Review
@@ -126,32 +138,21 @@ jobs:
           enable-autofix: 'false'
 ```
 
-For production workflows, pin `uses:` to a reviewed release or commit
-instead of a moving branch.
+Pin the Action to a reviewed release or commit instead of a moving branch for
+production workflows. Add `NVIDIA_API_KEY` as an Actions secret. Review
+publication requires `pull-requests: write`; `contents: read` is needed when
+the workflow checks out the Action or project files.
 
-### Required credentials and permissions
+## 7. Auto-Fix trust requirements and permissions
 
-- Add `NVIDIA_API_KEY` as an Actions repository secret. The Action
-  requires this input to call the NVIDIA API.
-- `github-token` defaults to `${{ github.token }}`; the example passes
-  it explicitly. No personal access token is required for review
-  submission when the generated token has the permissions below.
-- Grant `pull-requests: write` so the Action can fetch pull request
-  details and create reviews. The repository's self-test workflow also
-  grants `contents: read` to check out the trusted Action source.
-- Secrets and write permissions are restricted for many fork-originated
-  `pull_request` workflows. Test with a same-repository PR unless the
-  workflow is deliberately designed to handle fork contributions safely.
+Auto-Fix is off by default. It requires a same-repository PR and a checkout
+whose repository root, branch, and `HEAD` match the verified PR head SHA.
+Fork-originated PRs are rejected. The workflow must grant `contents: write`
+to push and `pull-requests: write` to validate the PR and report status.
 
-Auto-fix is optional and disabled by default. Do not enable it for this
-review-only setup. The self-test workflow intentionally keeps it disabled.
-
-### Optional auto-fix
-
-Auto-fix is supported only for same-repository pull requests; fork PRs are
-rejected before the fixing agent or test command runs. The checkout must be
-at the PR's exact head SHA, not GitHub's synthetic merge commit. For example,
-configure a trusted workflow as follows:
+The workflow invoking Auto-Fix must check out the PR head, not a synthetic
+merge commit, and should disable checkout credential persistence. A trusted
+workflow can use this pattern:
 
 ```yaml
 name: AI Review and Auto-Fix
@@ -174,7 +175,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      # Install the project and test dependencies here, using Python 3.12.
+      # Install the project and test dependencies using a trusted workflow.
 
       - name: Run AI review and auto-fix
         uses: Oussamagrimida/AI-Code-reviewer-Github-Action@main
@@ -186,96 +187,141 @@ jobs:
           max-fix-attempts: '2'
 ```
 
-Only enable this in a default-branch workflow trusted by repository
-maintainers. Do not use `pull_request_target` to run the auto-fixer or tests
-on PR-controlled code. Restrict eligible PR authors to trusted collaborators:
-tests execute code from the PR, so repository workflow configuration and the
-test command must be trusted.
+Do not use `pull_request_target` to run the fixer or PR-controlled tests with
+privileged credentials. Workflow files and test commands must be trusted by
+maintainers. Restrict eligible contributors according to the repository's
+risk policy; same-repository origin alone does not make PR code trustworthy.
 
-### Dual-mode auto-fix execution
+## 8. Reviewer-to-Fixer contract and eligibility
 
-The auto-fix engine operates in two distinct modes depending on project setup:
+The Reviewer builds `autofix_findings` only from validated issues. Each
+contract entry contains `id`, `path`, `line`, `category`, `severity`,
+`confidence`, `body`, `explanation`, `impact`, `remediation`, and
+`fixable=true`. IDs are deterministic for the finding identity and are
+revalidated by the Fixer.
 
-- **Mode 1 (Configured test suite)**: When `test-command` is provided (e.g.
-  `["python", "-m", "pytest", "-q"]`), the agent attempts fixes, executes tests
-  without a shell in a bounded retry loop (up to `max-fix-attempts`), and verifies
-  clean test passes before committing and pushing. If tests fail, attempts are
-  cleanly rolled back.
-- **Mode 2 (Basic deterministic validation)**: When `test-command` is omitted,
-  the agent proposes a fix and executes deterministic language syntax checks
-  (e.g., Python AST/compilation, JSON validation, JavaScript syntax checks).
-  - By default (`allow-unverified-push: 'false'`), changes are rolled back and
-    an informative PR comment is posted explaining the fix passed basic syntax
-    checks but was not pushed because no automated test suite was configured.
-  - When explicitly opted-in (`allow-unverified-push: 'true'`), the validated fix
-    is committed and pushed with an honest notice that only basic syntax checks ran.
-The test command has a 10-minute timeout; test output is bounded and only
-passed to the fixing agent for retries. A nonzero exit or timeout rolls back
-the current attempt and permits another attempt if any remain. Infrastructure
-failures, unauthorized file changes, and failed rollback stop immediately.
-`max-fix-attempts` accepts 1 through 5 and defaults to 2.
+Only findings with an authorized path, actionable explanation and
+remediation, confidence of at least 0.8, and severity `medium`, `high`, or
+`critical` are eligible. `missing_test`, informational/low-severity items,
+and findings without remediation are not auto-fixed. Paths under `.git` or
+`.github`, absolute paths, traversal paths, and symlinked paths are excluded.
+`has_bugs` reflects the presence of these eligible findings, not simply any
+published review comment.
 
-The agent receives only copies of the review-authorized files in a temporary
-workspace. The generated edits are checked against that allowlist before
-being copied into the checkout. Tests run with a reduced environment that
-omits `GITHUB_TOKEN` and `NVIDIA_API_KEY`; the checkout's persisted GitHub
-authentication header is removed before tests, and push credentials are
-provided only to the Git push subprocess without placing the token in its
-arguments or remote URL. On Linux, the fixer process is made non-dumpable
-before tests start so an unprivileged test child cannot read its initial
-environment through `/proc`. Auto-fix fails closed if this protection is
-unavailable or the runner is not Linux. Applying edits uses no-follow
-directory handles and atomic replacement, and fails closed where those
-filesystem primitives are unavailable. These restrictions are not a general
-OS sandbox and do not protect against privileged processes.
-Failed tests are rolled back and verified. Only validated modifications to
-existing authorized files are staged, committed, and pushed. The push is
-non-forced and is guarded by PR head-SHA checks.
+The Fixer rejects a missing, empty, malformed, oversized, or incorrectly
+shaped contract. Unauthorized entries are filtered by the shared path policy
+and never sent to the agent. If no authorized findings remain, Auto-Fix
+stops without generating a patch.
 
-Auto-fix requires `contents: write` to push and `pull-requests: write` to
-validate the PR and report the outcome. Keep `enable-autofix` false unless
-those permissions, the same-repository restriction, checkout SHA, trusted
-test command, and eligible authors are all configured deliberately.
+## 9. Patch generation and validation
 
-## Tests
+The coding agent receives only the validated findings and copies of their
+authorized files in a temporary workspace. The workspace is limited to 2 MiB
+per file and 8 MiB total; each agent invocation is limited to 12 graph steps.
+Every attempt resets the workspace from the same original file-content
+snapshot. Unexpected files and directories are removed without following
+symlinks, and deleted authorized copies are restored before the next attempt.
 
-Run the unit suite locally from the repository root:
+The agent cannot write directly to the repository through its workspace.
+Before applying its output, the fixer rejects symlinks, unexpected files,
+deletions, renames, and paths outside the authorized set. Applying changes
+uses no-follow directory handles and atomic replacement, and fails closed if
+the required filesystem primitives are unavailable.
+
+Only modifications to existing authorized files are allowed. The generated
+patch is bounded to 200 changed lines and 64 KiB, checked before tests, and
+checked again before staging. `.git`, `.github`, path traversal, and symlink
+protections are maintained throughout.
+
+## 10. Tests, independent verification, and retries
+
+When `test-command` is set, it must be a JSON array of arguments. It is
+executed without shell parsing and has a 10-minute timeout. Test output is
+bounded and redacted before being passed to a retry. A failed test attempt is
+rolled back before retrying.
+
+After tests pass, independent verification checks the original finding
+against the before/after code and exact patch. It must return a result for
+every finding, confirm each fix with confidence of at least 0.8, and report
+no regressions. Missing, malformed, failed, uncertain, or negative
+verification prevents a commit or push. This is a separate inference, not an
+independent provider or deterministic proof.
+
+`max-fix-attempts` accepts 1 through 5 and defaults to 2. The same limit
+applies when test validation or verification rejects a patch. Infrastructure
+failures, unsafe file changes, or an unverifiable rollback stop the process
+instead of retrying.
+
+When `test-command` is omitted, Mode 2 runs deterministic syntax/structure
+checks where supported (including Python compilation and JSON parsing).
+By default, changes are rolled back and not pushed. Setting
+`allow-unverified-push: 'true'` explicitly permits a push only after basic
+validation **and** independent verification; the resulting notice makes clear
+that a project test suite did not run.
+
+## 11. Rollback, Git operations, and credential handling
+
+The fixer requires a clean working tree before it starts and snapshots the
+checkout, index, and bounded Git metadata. It checks that tests did not alter
+the checkout or Git metadata. Rollback is verified; if verification fails,
+the fixer stops and does not commit or push.
+
+The fixer stages only the validated changed paths. It rejects staged
+pre-existing changes, unauthorized modifications, additions/deletions, and
+staged/unstaged mismatches. It rechecks the PR head before commit and push.
+Pushes are non-forced and target the verified PR branch.
+
+The checkout's persisted GitHub authorization header is removed before tests.
+`GITHUB_TOKEN` and `NVIDIA_API_KEY` are omitted from the test subprocess
+environment. Push credentials are supplied only to the Git push subprocess;
+the token is not placed in the command arguments or remote URL. Diagnostic
+logs redact known credentials and sensitive URLs, while public PR status
+comments remain generic.
+
+## 12. Tests, limitations, and rollout readiness
+
+Run the unit suite from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The GitHub Actions unit-test workflow uses Python 3.12 and runs the same
-pytest command. Tests include a controlled end-to-end pass through the
-GitHub diff fetch, NVIDIA response parsing, finding validation, and review
-publication boundaries. They do not verify live credentials, GitHub
-permissions, NVIDIA account/model availability, or real PR comment
-placement.
-
-For focused tests, run:
+For focused suites:
 
 ```bash
-python -m pytest -q tests/test_review.py
 python -m pytest -q tests/test_llm_review.py
+python -m pytest -q tests/test_review.py
 python -m pytest -q tests/test_fixer.py
 python -m pytest -q tests/test_benchmark.py
 ```
 
-## Known limitations
+The tests use controlled responses and temporary Git repositories. They cover
+review parsing and validation, contract transfer, path restrictions,
+workspace reset, patch validation, tests, verification, rollback, and push
+gates. They do not prove live NVIDIA model behavior, real GitHub permissions,
+or real PR comment placement.
 
-- Reviews cover only diff content returned by GitHub. Files without a
-  patch are skipped, and the model cannot inspect unrelated code unless
-  it is present in the supplied diff.
-- The model can miss real issues or produce invalid findings. Invalid
-  individual findings are discarded; if no valid findings remain but the
-  model returned a usable summary, the Action publishes a summary-only
-  review. If the full model response is malformed, the run fails instead of
-  publishing unvalidated output.
-- NVIDIA's API can return an asynchronous HTTP 202 response with a request
-  identifier. The current client handles synchronous completions only and
-  reports HTTP 202 as an API failure; it does not poll asynchronous jobs.
-- There is no cross-run review deduplication. Separate workflow runs may
-  submit similar or duplicate reviews.
-- The optional auto-fix path is separate from review submission and is
-  not enabled by default. It should be tested and permissioned separately.
+Known limitations:
+
+- Review coverage is limited to GitHub-returned diff patches. Files without
+  patches are skipped, and code outside the supplied diff may not be
+  available to the model.
+- Models can miss defects or produce invalid output. Invalid individual
+  findings are discarded; if no valid findings remain, review publication
+  and Auto-Fix are skipped. Malformed full responses and genuine API errors
+  fail the review.
+- The NVIDIA client handles synchronous completions. An asynchronous HTTP
+  202 response is treated as an API failure; the client does not poll jobs.
+- There is no cross-run deduplication, so separate workflow runs may post
+  similar reviews.
+- The test process has a reduced environment and Linux process protections,
+  but it is not an OS sandbox. Test code may still access the runner's
+  ordinary filesystem and network; privileged processes are outside this
+  protection.
+- The model verifier can make mistakes. Tests passing and model verification
+  succeeding are not guarantees that a fix is correct.
+
+Begin with supervised, same-repository integration testing. Do not treat
+passing unit tests as evidence that the Auto-Fixer is ready for unattended
+production use.

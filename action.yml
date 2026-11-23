@@ -77,7 +77,7 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        REVIEW_ISSUES: ${{ steps.review.outputs.issues_summary }}
+        REVIEW_FINDINGS_JSON: ${{ steps.review.outputs.autofix_findings }}
         AUTOFIX_TEST_COMMAND: ${{ inputs.test-command }}
         AUTOFIX_MAX_ATTEMPTS: ${{ inputs.max-fix-attempts }}
         AUTOFIX_ALLOW_UNVERIFIED_PUSH: ${{ inputs.allow-unverified-push }}

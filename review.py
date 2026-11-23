@@ -12,6 +12,10 @@ from collections.abc import Mapping
 import requests
 
 import llm_review
+from autofix_contract import (
+    build_autofix_findings,
+    serialize_autofix_findings,
+)
 
 GITHUB_API = "https://api.github.com"
 RETRYABLE_GITHUB_STATUSES = {429, 500, 502, 503, 504}
@@ -405,30 +409,7 @@ def write_github_outputs(review: dict):
     auto-fix step through GitHub Actions outputs.
     """
 
-    fixable_categories = {
-        "correctness",
-        "security",
-        "performance",
-        "concurrency",
-        "resource_management",
-        "error_handling",
-        "edge_case",
-    }
-
-    fixable_severities = {
-        "critical",
-        "high",
-        "medium",
-    }
-
-    fixable = [
-        issue
-        for issue in review.get("issues", [])
-        if (
-            issue.get("category") in fixable_categories
-            and issue.get("severity") in fixable_severities
-        )
-    ]
+    fixable = build_autofix_findings(review.get("issues", []))
 
     gh_output_path = os.environ.get("GITHUB_OUTPUT")
 
@@ -458,6 +439,10 @@ def write_github_outputs(review: dict):
     ) as f:
         f.write(
             f"has_bugs={'true' if fixable else 'false'}\n"
+        )
+        f.write(
+            "autofix_findings="
+            f"{serialize_autofix_findings(fixable)}\n"
         )
 
         f.write(f"issues_summary<<{delimiter}\n")

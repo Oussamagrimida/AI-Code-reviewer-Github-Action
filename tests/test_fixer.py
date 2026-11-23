@@ -7,20 +7,78 @@ is running in.
 """
 
 import base64
+import json
 import os
 import stat
 import subprocess
 from pathlib import Path
 import sys
+from types import ModuleType
 
 import pytest
 
 import fixer
+import autofix_contract
 
 _REAL_SUBPROCESS_RUN = subprocess.run
 _PROTECT_TEST_PROCESS_ENVIRONMENT = fixer._protect_test_process_environment
 _APPLY_AUTHORIZED_FILE = fixer._apply_authorized_file
 _OPEN_REPOSITORY_FILE = fixer._open_repository_file
+
+
+def test_build_agent_uses_the_reviewer_model(monkeypatch, tmp_path):
+    observed = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            observed["model"] = kwargs["model"]
+
+    class FakeFilesystemBackend:
+        def __init__(self, **kwargs):
+            observed["backend_root"] = kwargs["root_dir"]
+
+    def create_deep_agent(**kwargs):
+        observed["agent_model"] = kwargs["model"]
+        return object()
+
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = create_deep_agent
+    deepagents_backends = ModuleType("deepagents.backends")
+    deepagents_backends.FilesystemBackend = FakeFilesystemBackend
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(
+        sys.modules, "deepagents.backends", deepagents_backends
+    )
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+
+    fixer.build_agent(["tracked.txt"], str(tmp_path))
+
+    assert observed["model"] == "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    assert observed["model"] == fixer.llm_review.MODEL
+    assert isinstance(observed["agent_model"], FakeChatOpenAI)
+    assert observed["backend_root"] == str(tmp_path)
+
+
+def _finding_contract(path="tracked.txt", root_dir=None, **overrides):
+    issue = {
+        "path": path,
+        "line": 1,
+        "category": "correctness",
+        "severity": "high",
+        "confidence": 0.95,
+        "body": "The changed result is incorrect.",
+        "explanation": "The changed expression produces the wrong result.",
+        "impact": "Callers receive an incorrect value.",
+        "remediation": "Use the correct operation.",
+    }
+    issue.update(overrides)
+    findings = autofix_contract.build_autofix_findings(
+        [issue], root_dir=root_dir
+    )
+    return autofix_contract.serialize_autofix_findings(findings)
 
 
 def _git(repo, *args, check=True):
@@ -232,7 +290,7 @@ def test_dirty_worktree_stops_before_agent_runs(git_repo, monkeypatch):
     agent_calls = []
 
     class UnexpectedAgent:
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             agent_calls.append(payload)
             raise AssertionError("agent must not run on a dirty worktree")
 
@@ -251,7 +309,7 @@ def test_dirty_worktree_stops_before_agent_runs(git_repo, monkeypatch):
 def test_change_outside_allowlist_prevents_commit_and_push(
     git_repo, monkeypatch
 ):
-    monkeypatch.setenv("REVIEW_ISSUES", "- tracked.txt:1 [bug] broken")
+    monkeypatch.setenv("REVIEW_FINDINGS_JSON", _finding_contract())
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
     monkeypatch.setenv("PR_NUMBER", "7")
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
@@ -274,7 +332,7 @@ def test_change_outside_allowlist_prevents_commit_and_push(
         def __init__(self, root):
             self.root = root
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             (Path(self.root) / "unauthorized.txt").write_text(
                 "nope\n", encoding="utf-8"
             )
@@ -406,7 +464,7 @@ def _prepare_main_test(
     git_repo, monkeypatch, token, comments, summary="summary", agent_changes=True
 ):
     head_sha = _git(git_repo, "rev-parse", "HEAD").stdout.strip()
-    monkeypatch.setenv("REVIEW_ISSUES", "- tracked.txt:1 [bug] broken")
+    monkeypatch.setenv("REVIEW_FINDINGS_JSON", _finding_contract())
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
     monkeypatch.setenv("PR_NUMBER", "9")
     monkeypatch.setenv("GITHUB_TOKEN", token)
@@ -423,6 +481,11 @@ def _prepare_main_test(
         "get_pull_request",
         lambda *args: _pull_request(sha=head_sha),
     )
+    monkeypatch.setattr(
+        fixer,
+        "verify_fixes",
+        lambda *args: {"verified": True},
+    )
 
     class FakeMessage:
         content = summary
@@ -431,7 +494,7 @@ def _prepare_main_test(
         def __init__(self, root):
             self.root = root
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             if agent_changes:
                 (Path(self.root) / "tracked.txt").write_text(
                     "modified by agent\n", encoding="utf-8"
@@ -477,7 +540,7 @@ def test_agent_failures_log_sanitized_context_and_verify_rollback(
         def __init__(self, root):
             self.root = root
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             invocation_count.append(payload)
             if failure_stage == "agent invocation":
                 raise RuntimeError(failure_message)
@@ -566,24 +629,28 @@ def test_agent_receives_only_findings_for_allowed_paths(
 
     comments = []
     _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
-    review_issues = "\n".join(
+    authorized_issue = autofix_contract.build_autofix_findings(
         [
-            "- backend/app/api/routes/items.py:87 [correctness] Update fields safely.",
-            "Impact: the update could otherwise overwrite existing data.",
-            "Remediation: validate the new value before saving.",
-            "- .github/workflows/ai-reviewer.yml:27 [security] Protect workflow.",
-            "Impact: this workflow finding must not reach the fixing agent.",
-            "Remediation: do not modify any workflow file.",
+            {
+                "path": backend_paths[0],
+                "line": 87,
+                "category": "correctness",
+                "severity": "high",
+                "confidence": 0.95,
+                "body": "Update fields safely.",
+                "explanation": "The update can overwrite existing data.",
+                "impact": "Existing values can be lost.",
+                "remediation": "Validate the new value before saving.",
+            }
         ]
+    )[0]
+    unauthorized_issue = dict(authorized_issue)
+    unauthorized_issue["path"] = ".github/workflows/ai-reviewer.yml"
+    unauthorized_issue["id"] = autofix_contract._finding_id(unauthorized_issue)
+    review_issues = autofix_contract.serialize_autofix_findings(
+        [authorized_issue, unauthorized_issue]
     )
-    authorized_finding = "\n".join(
-        [
-            "- backend/app/api/routes/items.py:87 [correctness] Update fields safely.",
-            "Impact: the update could otherwise overwrite existing data.",
-            "Remediation: validate the new value before saving.",
-        ]
-    )
-    monkeypatch.setenv("REVIEW_ISSUES", review_issues)
+    monkeypatch.setenv("REVIEW_FINDINGS_JSON", review_issues)
     authorized_paths = []
     agent_tasks = []
 
@@ -591,7 +658,7 @@ def test_agent_receives_only_findings_for_allowed_paths(
         def __init__(self, root):
             self.root = root
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             agent_tasks.append(payload["messages"][0]["content"])
 
     def build_agent(allowed_paths, root):
@@ -609,11 +676,10 @@ def test_agent_receives_only_findings_for_allowed_paths(
 
     assert authorized_paths == backend_paths
     assert len(agent_tasks) == 1
-    assert authorized_finding in agent_tasks[0]
+    assert "backend/app/api/routes/items.py" in agent_tasks[0]
+    assert "Update fields safely." in agent_tasks[0]
     assert ".github/workflows/ai-reviewer.yml" not in agent_tasks[0]
-    assert "this workflow finding must not reach the fixing agent" not in agent_tasks[0]
-    assert "do not modify any workflow file" not in agent_tasks[0]
-    assert os.environ["REVIEW_ISSUES"] == review_issues
+    assert os.environ["REVIEW_FINDINGS_JSON"] == review_issues
     assert fixer._git_status_entries() == []
 
 
@@ -662,7 +728,7 @@ def test_agent_summary_is_not_published_when_changes_are_discarded(
         def __init__(self, root):
             self.root = root
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             (Path(self.root) / "unauthorized.txt").write_text(
                 "unexpected\n", encoding="utf-8"
             )
@@ -708,7 +774,10 @@ def test_main_reports_non_git_working_directory_before_agent(
     not_a_repo.mkdir()
     monkeypatch.chdir(not_a_repo)
     monkeypatch.setenv("GITHUB_WORKSPACE", str(not_a_repo))
-    monkeypatch.setenv("REVIEW_ISSUES", "- tracked.txt:1 [bug] private issue")
+    monkeypatch.setenv(
+        "REVIEW_FINDINGS_JSON",
+        _finding_contract(root_dir=str(not_a_repo)),
+    )
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
     monkeypatch.setenv("PR_NUMBER", "9")
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
@@ -1288,15 +1357,123 @@ def test_get_pull_request_hides_error_response(monkeypatch):
     assert "raw server text" not in message
 
 
-def test_extract_allowed_paths_supports_spaces_and_rejects_metadata(git_repo):
-    assert fixer.extract_allowed_paths(
-        "- source file.py:12 [correctness] repair this"
-    ) == ["source file.py"]
-    assert fixer.extract_allowed_paths(
-        "- .git/config:1 [security] unsafe\n"
-        "- ../outside.py:2 [security] unsafe\n"
-        "- .github/workflows/build.yml:3 [security] unsafe"
-    ) == []
+def test_finding_contract_supports_spaces_and_rejects_metadata_paths(git_repo):
+    serialized = _finding_contract(path="source file.py")
+    findings = fixer.parse_autofix_findings(serialized)
+
+    assert [finding["path"] for finding in findings] == ["source file.py"]
+    assert not fixer._is_authorized_path(".git/config")
+    assert not fixer._is_authorized_path("../outside.py")
+    assert not fixer._is_authorized_path(".github/workflows/build.yml")
+
+
+def test_finding_contract_rejects_markdown_and_modified_identifiers(git_repo):
+    with pytest.raises(autofix_contract.FindingContractError):
+        fixer.parse_autofix_findings("- tracked.txt:1 [correctness] fix")
+
+    finding = json.loads(_finding_contract())[0]
+    finding["explanation"] = "A changed explanation."
+    with pytest.raises(
+        autofix_contract.FindingContractError,
+        match="identifier is invalid",
+    ):
+        fixer.parse_autofix_findings(json.dumps([finding]))
+
+
+def test_patch_scope_rejects_large_line_and_byte_diffs(
+    recorded_git, monkeypatch
+):
+    repo, commands = recorded_git
+    (repo / "tracked.txt").write_text(
+        "".join(f"line {number}\n" for number in range(201)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(fixer.ValidationError, match="changed-line limit"):
+        fixer.commit_and_push(
+            "feature", "test-token", "owner/repo", ["tracked.txt"]
+        )
+    assert not any("add" in command for command in commands)
+    assert not any("commit" in command for command in commands)
+    assert not any("push" in command for command in commands)
+
+    (repo / "tracked.txt").write_text("small change\n", encoding="utf-8")
+    monkeypatch.setattr(fixer, "_MAX_PATCH_DIFF_BYTES", 32)
+    with pytest.raises(fixer.ValidationError, match="byte limit"):
+        fixer._validate_patch_scope(["tracked.txt"], ["tracked.txt"])
+
+
+def test_independent_verification_compares_original_patch_and_updated_code(
+    git_repo, monkeypatch
+):
+    finding = json.loads(_finding_contract())[0]
+    (git_repo / "tracked.txt").write_text("fixed result\n", encoding="utf-8")
+    patch = fixer._validate_patch_scope(["tracked.txt"], ["tracked.txt"])
+    captured = {}
+
+    def fake_model_call(prompt, diff_text, headers, budget_tracker):
+        captured.update({
+            "prompt": prompt,
+            "diff": diff_text,
+            "headers": headers,
+            "budget": budget_tracker,
+        })
+        return {
+            "verified": True,
+            "findings": [{
+                "id": finding["id"],
+                "fixed": True,
+                "confidence": 0.95,
+                "reason": "The changed expression now returns the expected value.",
+            }],
+            "regressions": [],
+        }
+
+    monkeypatch.setattr(
+        fixer.llm_review, "_call_model_for_prompt", fake_model_call
+    )
+
+    result = fixer.verify_fixes(
+        [finding],
+        {"tracked.txt": b"original result\n"},
+        ["tracked.txt"],
+        patch,
+        "nvidia-test-key",
+    )
+
+    assert result == {"verified": True}
+    assert "before and after code" in captured["prompt"]
+    assert "original result" in captured["diff"]
+    assert "fixed result" in captured["diff"]
+    assert json.loads(captured["diff"])["patch"] == patch
+    assert captured["headers"]["Authorization"] == "Bearer nvidia-test-key"
+    assert captured["budget"] == {"calls": 0, "max_calls": 1}
+
+
+def test_independent_verification_rejects_incomplete_response(
+    git_repo, monkeypatch
+):
+    finding = json.loads(_finding_contract())[0]
+    (git_repo / "tracked.txt").write_text("fixed\n", encoding="utf-8")
+    patch = fixer._validate_patch_scope(["tracked.txt"], ["tracked.txt"])
+    monkeypatch.setattr(
+        fixer.llm_review,
+        "_call_model_for_prompt",
+        lambda *args, **kwargs: {
+            "verified": True,
+            "findings": [],
+            "regressions": [],
+        },
+    )
+
+    with pytest.raises(fixer.ValidationError, match="invalid response"):
+        fixer.verify_fixes(
+            [finding],
+            {"tracked.txt": b"original\n"},
+            ["tracked.txt"],
+            patch,
+            "nvidia-test-key",
+        )
 
 
 def test_agent_workspace_contains_only_authorized_files(git_repo, tmp_path):
@@ -1309,6 +1486,17 @@ def test_agent_workspace_contains_only_authorized_files(git_repo, tmp_path):
     assert not (sandbox / "private.txt").exists()
     assert not (sandbox / ".git").exists()
     assert workspace["allowed"] == {"tracked.txt"}
+
+
+def test_agent_workspace_rejects_files_over_context_limit(git_repo, tmp_path):
+    (git_repo / "tracked.txt").write_bytes(
+        b"x" * (fixer._MAX_AGENT_FILE_BYTES + 1)
+    )
+
+    with pytest.raises(fixer.ValidationError, match="could not be prepared"):
+        fixer._create_agent_workspace(
+            ["tracked.txt"], str(tmp_path / "oversized-agent")
+        )
 
 
 def test_agent_workspace_rejects_preexisting_contents(git_repo, tmp_path):
@@ -1618,19 +1806,30 @@ def test_main_retries_failed_fix_and_pushes_only_after_success(
         },
     ])
     test_calls = []
+    verification_calls = []
     monkeypatch.setattr(
         fixer,
         "run_test_command",
         lambda command: (test_calls.append(command), next(outcomes))[1],
+    )
+    monkeypatch.setattr(
+        fixer,
+        "verify_fixes",
+        lambda *args: (
+            verification_calls.append(args),
+            {"verified": True},
+        )[1],
     )
 
     class RetryAgent:
         def __init__(self, root):
             self.root = root
             self.payloads = []
+            self.configs = []
 
-        def invoke(self, payload):
+        def invoke(self, payload, **kwargs):
             self.payloads.append(payload)
+            self.configs.append(kwargs.get("config"))
             (Path(self.root) / "tracked.txt").write_text(
                 "fixed\n", encoding="utf-8"
             )
@@ -1654,8 +1853,305 @@ def test_main_retries_failed_fix_and_pushes_only_after_success(
     assert len(agent.payloads) == 2
     assert "first attempt failed" in agent.payloads[1]["messages"][0]["content"]
     assert len(test_calls) == 2
+    assert len(verification_calls) == 1
+    assert agent.configs == [
+        {"recursion_limit": fixer._AGENT_RECURSION_LIMIT},
+        {"recursion_limit": fixer._AGENT_RECURSION_LIMIT},
+    ]
     assert len(commits) == 1
     assert "passed the configured tests" in comments[-1]
+
+
+def test_agent_workspace_reset_restores_deleted_files_and_removes_extras(
+    git_repo, tmp_path
+):
+    second_path = git_repo / "src" / "second.py"
+    second_path.parent.mkdir()
+    second_path.write_text("original second file\n", encoding="utf-8")
+    workspace = fixer._create_agent_workspace(
+        ["tracked.txt", "src/second.py"],
+        str(tmp_path / "agent-workspace"),
+    )
+    root = Path(workspace["root"])
+
+    (root / "tracked.txt").write_text("failed attempt\n", encoding="utf-8")
+    (root / "src" / "second.py").unlink()
+    extra_file = root / "unexpected" / "nested.txt"
+    extra_file.parent.mkdir()
+    extra_file.write_text("must not survive\n", encoding="utf-8")
+
+    fixer._reset_agent_workspace(workspace)
+
+    assert (root / "tracked.txt").read_bytes() == b"original\n"
+    assert (root / "src" / "second.py").read_bytes() == b"original second file\n"
+    assert not (root / "unexpected").exists()
+    assert {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+    } == {"tracked.txt", "src/second.py"}
+
+
+def test_main_retry_uses_original_workspace_and_can_succeed_after_rejection(
+    git_repo, monkeypatch
+):
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    test_calls = []
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda command: (
+            test_calls.append(command),
+            {
+                "passed": True,
+                "exit_code": 0,
+                "timed_out": False,
+                "output": "passed",
+            },
+        )[1],
+    )
+    verification_results = iter([
+        {"verified": False},
+        {"verified": True},
+    ])
+    monkeypatch.setattr(
+        fixer, "verify_fixes", lambda *args: next(verification_results)
+    )
+    workspace_baseline = []
+    repository_baseline = []
+
+    class BaselineCheckingAgent:
+        def __init__(self, root):
+            self.root = Path(root)
+            self.calls = 0
+
+        def invoke(self, payload, **kwargs):
+            self.calls += 1
+            workspace_file = self.root / "tracked.txt"
+            if self.calls == 2:
+                assert workspace_file.read_bytes() == workspace_baseline[0]
+                assert (git_repo / "tracked.txt").read_bytes() == (
+                    repository_baseline[0]
+                )
+                workspace_file.write_text(
+                    "successful retry\n", encoding="utf-8"
+                )
+                return
+            repository_baseline.append(
+                (git_repo / "tracked.txt").read_bytes()
+            )
+            workspace_file.write_text("failed attempt\n", encoding="utf-8")
+
+    agent = BaselineCheckingAgent("")
+
+    def build_agent(allowed, root):
+        agent.root = Path(root)
+        workspace_baseline.append(
+            (agent.root / "tracked.txt").read_bytes()
+        )
+        return agent
+
+    monkeypatch.setattr(
+        fixer, "build_agent", build_agent
+    )
+    commits = []
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    assert agent.calls == 2
+    assert len(test_calls) == 2
+    assert len(commits) == 1
+    assert (git_repo / "tracked.txt").read_text(encoding="utf-8") == (
+        "successful retry\n"
+    )
+    assert "passed the configured tests" in comments[-1]
+
+
+def test_main_does_not_push_when_independent_verification_rejects(
+    git_repo, monkeypatch
+):
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    monkeypatch.setenv("AUTOFIX_MAX_ATTEMPTS", "1")
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda command: {
+            "passed": True,
+            "exit_code": 0,
+            "timed_out": False,
+            "output": "passed",
+        },
+    )
+    monkeypatch.setattr(
+        fixer, "verify_fixes", lambda *args: {"verified": False}
+    )
+    commits = []
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    assert commits == []
+    assert (git_repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
+    assert fixer._git_status_entries() == []
+    assert any("independent verifier did not confirm" in body for body in comments)
+
+
+def test_main_retries_verification_rejection_within_attempt_limit(
+    git_repo, monkeypatch
+):
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    test_calls = []
+    verification_results = iter([
+        {"verified": False},
+        {"verified": True},
+    ])
+    verification_calls = []
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda command: (
+            test_calls.append(command),
+            {
+                "passed": True,
+                "exit_code": 0,
+                "timed_out": False,
+                "output": "passed",
+            },
+        )[1],
+    )
+    monkeypatch.setattr(
+        fixer,
+        "verify_fixes",
+        lambda *args: (
+            verification_calls.append(args),
+            next(verification_results),
+        )[1],
+    )
+
+    class RetryVerificationAgent:
+        def __init__(self, root):
+            self.root = root
+            self.calls = 0
+
+        def invoke(self, payload, **kwargs):
+            self.calls += 1
+            (Path(self.root) / "tracked.txt").write_text(
+                f"verified fix {self.calls}\n", encoding="utf-8"
+            )
+
+    agent = RetryVerificationAgent("")
+    monkeypatch.setattr(
+        fixer,
+        "build_agent",
+        lambda allowed, root: setattr(agent, "root", root) or agent,
+    )
+    commits = []
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    assert agent.calls == 2
+    assert len(test_calls) == 2
+    assert len(verification_calls) == 2
+    assert len(commits) == 1
+    assert "passed the configured tests" in comments[-1]
+
+
+def test_main_does_not_push_when_independent_verification_fails(
+    git_repo, monkeypatch
+):
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda command: {
+            "passed": True,
+            "exit_code": 0,
+            "timed_out": False,
+            "output": "passed",
+        },
+    )
+    monkeypatch.setattr(
+        fixer,
+        "verify_fixes",
+        lambda *args: (_ for _ in ()).throw(
+            fixer.llm_review.NVIDIAAPIError("verification API unavailable")
+        ),
+    )
+    commits = []
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    assert commits == []
+    assert (git_repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
+    assert fixer._git_status_entries() == []
+    assert any("could not be completed" in body for body in comments)
+
+
+def test_main_rejects_oversized_patch_before_tests_or_push(
+    git_repo, monkeypatch, capsys
+):
+    comments = []
+    _prepare_main_test(git_repo, monkeypatch, "test-token", comments)
+    test_calls = []
+    commits = []
+
+    class OversizedAgent:
+        def __init__(self, root):
+            self.root = root
+
+        def invoke(self, payload, **kwargs):
+            (Path(self.root) / "tracked.txt").write_text(
+                "".join(f"line {number}\n" for number in range(201)),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(
+        fixer,
+        "build_agent",
+        lambda allowed, root: OversizedAgent(root),
+    )
+    monkeypatch.setattr(
+        fixer,
+        "run_test_command",
+        lambda *args, **kwargs: test_calls.append(args),
+    )
+    monkeypatch.setattr(
+        fixer,
+        "commit_and_push",
+        lambda *args, **kwargs: commits.append(args),
+    )
+
+    fixer.main()
+
+    assert test_calls == []
+    assert commits == []
+    assert (git_repo / "tracked.txt").read_text(encoding="utf-8") == "original\n"
+    assert fixer._git_status_entries() == []
+    assert any("bounded safety checks" in body for body in comments)
+    assert "[stage=patch validation]" in capsys.readouterr().out
 
 
 def test_main_rolls_back_after_all_attempts_fail(git_repo, monkeypatch):

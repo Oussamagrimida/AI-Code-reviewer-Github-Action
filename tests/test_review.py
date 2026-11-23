@@ -6,6 +6,7 @@ import subprocess
 import sys
 import json
 from requests.structures import CaseInsensitiveDict
+import fixer
 
 def test_post_review_sends_correct_github_payload(monkeypatch):
     captured = {}
@@ -623,6 +624,9 @@ def test_main_posts_review_when_pr_head_sha_is_unchanged(
                 "severity": "high",
                 "confidence": 0.95,
                 "body": "Handle this changed value.",
+                "explanation": "The changed value can be incorrect.",
+                "impact": "",
+                "remediation": "Validate the value before using it.",
             }
         ],
     }
@@ -716,7 +720,7 @@ def _model_finding(line, body):
         "body": body,
         "explanation": body,
         "impact": "",
-        "remediation": "",
+        "remediation": "Apply the correction described in the finding.",
     }
 
 
@@ -750,6 +754,38 @@ def test_main_posts_valid_findings_and_ignores_invalid_findings(
     assert "Valid finding." in output
     assert "Invalid finding" not in output
     assert "Discarded invalid finding 2" in capsys.readouterr().out
+
+
+def test_validated_finding_contract_transfers_to_fixer(
+    monkeypatch, tmp_path
+):
+    output_file = tmp_path / "github_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    patch = "@@ -1 +1,2 @@\n context\n+new code\n"
+    model_result = {
+        "summary": "The changed expression is incorrect.",
+        "issues": [_model_finding(2, "The changed expression is incorrect.")],
+    }
+
+    validated = review.llm_review.validate_review(
+        model_result,
+        [{"path": "src/example.py", "patch": patch}],
+    )
+    review.write_github_outputs(validated)
+    contract_line = next(
+        line for line in output_file.read_text(encoding="utf-8").splitlines()
+        if line.startswith("autofix_findings=")
+    )
+
+    findings = fixer.parse_autofix_findings(
+        contract_line.split("=", 1)[1]
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["path"] == "src/example.py"
+    assert findings[0]["line"] == 2
+    assert findings[0]["explanation"] == "The changed expression is incorrect."
+    assert findings[0]["remediation"]
 
 
 def test_main_finishes_without_posting_when_all_findings_are_invalid(
@@ -903,6 +939,9 @@ def test_write_github_outputs_with_fixable_issue(monkeypatch, tmp_path):
                 "severity": "high",
                 "confidence": 0.95,
                 "body": "Incorrect result.",
+                "explanation": "The added expression returns an incorrect result.",
+                "impact": "Callers receive the wrong value.",
+                "remediation": "Use the correct arithmetic operation.",
             }
         ]
     }
@@ -915,6 +954,16 @@ def test_write_github_outputs_with_fixable_issue(monkeypatch, tmp_path):
     assert "issues_summary<<EOF" in output
     assert "src/example.py:2" in output
     assert "Incorrect result." in output
+    autofix_line = next(
+        line for line in output.splitlines()
+        if line.startswith("autofix_findings=")
+    )
+    findings = json.loads(autofix_line.split("=", 1)[1])
+    assert len(findings) == 1
+    assert findings[0]["path"] == "src/example.py"
+    assert findings[0]["line"] == 2
+    assert findings[0]["fixable"] is True
+    assert findings[0]["id"].startswith("finding-")
 
 
 def test_write_github_outputs_without_fixable_issues(monkeypatch, tmp_path):
@@ -927,6 +976,54 @@ def test_write_github_outputs_without_fixable_issues(monkeypatch, tmp_path):
 
     assert "has_bugs=false" in output
     assert "issues_summary<<EOF" in output
+
+
+def test_write_github_outputs_only_marks_authorized_actionable_findings(
+    monkeypatch, tmp_path
+):
+    output_file = tmp_path / "github_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    finding = {
+        "path": "backend/items.py",
+        "line": 12,
+        "category": "correctness",
+        "severity": "high",
+        "confidence": 0.95,
+        "body": "The result is incorrect.",
+        "explanation": "The changed expression subtracts instead of adding.",
+        "impact": "Callers receive an incorrect total.",
+        "remediation": "Use addition.",
+    }
+
+    review.write_github_outputs({
+        "issues": [
+            finding,
+            {**finding, "path": ".github/workflows/review.yml"},
+            {**finding, "confidence": 0.79},
+            {**finding, "remediation": ""},
+        ]
+    })
+
+    output = output_file.read_text(encoding="utf-8")
+    assert "has_bugs=true" in output
+    contract_line = next(
+        line for line in output.splitlines()
+        if line.startswith("autofix_findings=")
+    )
+    serialized_findings = json.loads(contract_line.split("=", 1)[1])
+    assert [issue["path"] for issue in serialized_findings] == [
+        "backend/items.py"
+    ]
+
+    unauthorized_output = tmp_path / "github_only_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(unauthorized_output))
+    review.write_github_outputs({
+        "issues": [{**finding, "path": ".github/workflows/review.yml"}]
+    })
+    unauthorized_text = unauthorized_output.read_text(encoding="utf-8")
+    assert "has_bugs=false" in unauthorized_text
+    assert "autofix_findings=[]" in unauthorized_text
+
 
 def test_write_github_outputs_uses_safe_delimiter(monkeypatch, tmp_path):
     output_file = tmp_path / "github_output.txt"
@@ -941,6 +1038,9 @@ def test_write_github_outputs_uses_safe_delimiter(monkeypatch, tmp_path):
                 "severity": "high",
                 "confidence": 0.95,
                 "body": "Incorrect result.\nEOF\nAdditional details.",
+                "explanation": "The added expression returns an incorrect result.",
+                "impact": "",
+                "remediation": "Use the correct arithmetic operation.",
             }
         ]
     }
@@ -973,6 +1073,9 @@ def test_write_github_outputs_flattens_multiline_issue_bodies(
                 "severity": "high",
                 "confidence": 0.95,
                 "body": "Broken result.\n- secret.py:1 [security] injected path",
+                "explanation": "The changed expression can return the wrong value.",
+                "impact": "",
+                "remediation": "Use the correct operation.",
             }
         ]
     })
